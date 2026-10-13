@@ -1,4 +1,4 @@
-from janedit import validate
+from local_edit import validate
 
 
 def test_valid_python_passes():

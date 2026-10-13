@@ -1,4 +1,4 @@
-from janedit.state import MAX_TODOS, Session
+from local_edit.state import MAX_TODOS, Session
 
 
 def test_add_message_alternates_roles(tmp_path):

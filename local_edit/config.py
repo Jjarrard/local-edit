@@ -1,6 +1,6 @@
 """Persisted user preferences (model choices, toggles).
 
-Lives in ~/.janedit/config.json rather than in the project, because which
+Lives in ~/.local-edit/config.json rather than in the project, because which
 models exist is a property of the machine running Jan, not of the code being
 edited. Every read is defensive: a corrupt or hand-edited config degrades to
 defaults instead of crashing the app on startup.
@@ -15,10 +15,23 @@ from pathlib import Path
 
 
 def config_dir() -> Path:
-    override = os.environ.get("JANEDIT_CONFIG_DIR")
+    override = os.environ.get("LOCAL_EDIT_CONFIG_DIR")
     if override:
         return Path(override)
-    return Path.home() / ".janedit"
+    return Path.home() / ".local-edit"
+
+
+def migrate_legacy_dir(new: Path) -> None:
+    """Move a `.janedit` dir (this tool's old name) to `new`, once.
+
+    Leaves both alone if `new` already exists, so nothing is ever overwritten.
+    """
+    old = new.with_name(".janedit")
+    if old.is_dir() and not new.exists():
+        try:
+            old.rename(new)
+        except OSError:
+            pass
 
 
 def config_path() -> Path:

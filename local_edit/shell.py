@@ -34,14 +34,14 @@ DEFAULT_TIMEOUT = 60
 MAX_OUTPUT_CHARS = 4000
 MAX_OUTPUT_LINES = 120
 
-# Per-project override file: <project>/.janedit/command_rules.json. Lets a
+# Per-project override file: <project>/.local-edit/command_rules.json. Lets a
 # team tune the classifier for their own toolchain without editing source.
 # Schema (all keys optional):
 #   {"allow_programs": ["mvn"], "deny_programs": ["ssh"],
 #    "allow_subcommands": {"docker": ["build"]}}
 # Overrides can only ADD to the built-in allow/deny lists, never remove from
 # BLOCKED_PATTERNS - a project config is not allowed to re-enable `rm -rf`.
-COMMAND_RULES_FILE = ".janedit/command_rules.json"
+COMMAND_RULES_FILE = ".local-edit/command_rules.json"
 
 # Commands that are read-only enough to run without asking every time.
 SAFE_COMMANDS = {
@@ -142,7 +142,7 @@ class CommandRules:
 
 
 def load_command_rules(root: Path | None) -> CommandRules:
-    """Read `<root>/.janedit/command_rules.json`, if present.
+    """Read `<root>/.local-edit/command_rules.json`, if present.
 
     Malformed or missing config is silent and inert (empty rules) - a broken
     override file must never itself block or unblock anything.

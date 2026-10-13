@@ -10,9 +10,9 @@ import io
 
 from rich.console import Console
 
-from janedit.agent import Agent
-from janedit.protocol import parse_action, strip_hallucinated_continuation
-from janedit.state import Session
+from local_edit.agent import Agent
+from local_edit.protocol import parse_action, strip_hallucinated_continuation
+from local_edit.state import Session
 
 HALLUCINATED = """LIST .
 Result:

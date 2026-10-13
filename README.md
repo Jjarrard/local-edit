@@ -1,4 +1,4 @@
-# janedit
+# local-edit
 
 A code-editing agent framework built for the dumbest local models you'd
 actually run — 1-3B — hooked into [Jan](https://jan.ai)'s local
@@ -20,7 +20,7 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 Then run it via the wrapper script:
 
 ```bash
-./janedit-run --project /path/to/your/code
+./local-edit-run --project /path/to/your/code
 ```
 
 That's it — no venv activation, no flags. It picks up your last-used model,
@@ -28,14 +28,14 @@ talks to Jan, and edits files in place. Make it a bare command (run this from
 inside the repo folder):
 
 ```bash
-echo "alias janedit=\"$(pwd)/janedit-run\"" >> ~/.zshrc
+echo "alias local-edit=\"$(pwd)/local-edit-run\"" >> ~/.zshrc
 ```
 
 ## Switching models
 
 `/model` with no argument opens an arrow-key picker: up/down to move, type to
 filter, Enter to select, Esc to cancel. Most-recently-used models sort first,
-and your choice is remembered in `~/.janedit/config.json` between runs.
+and your choice is remembered in `~/.local-edit/config.json` between runs.
 
 There are two model slots, because the jobs are different:
 
@@ -59,7 +59,7 @@ model **cannot** do:
   with the specific error and the file is left untouched. Validators are a
   pluggable suffix->function registry (`validate.register_validator`), so
   wiring in a new language doesn't mean editing the dispatch logic. See
-  [`validate.py`](janedit/validate.py).
+  [`validate.py`](local_edit/validate.py).
 - **Can't leave a half-written file.** Writes go to a temp file in the same
   directory and are moved into place with an atomic rename, so a process
   killed mid-write can never leave a file with a mix of old and new content.
@@ -69,18 +69,18 @@ model **cannot** do:
   before/after text rather than a unified diff, because small models misread
   diffs and reject correct fixes. If the model reconsiders and re-sends the
   _identical_ edit, it goes through — one wrong verdict must not deadlock the
-  session. See [`review.py`](janedit/review.py).
+  session. See [`review.py`](local_edit/review.py).
 - **Can't fake having done the work.** A model that replies with an invented
   transcript (`You: INSERT ... Result: tests passed ... DONE`) gets everything
   after the first real command stripped, and it never enters history — so it
   can't read its own fiction next turn and double down. See
-  `strip_hallucinated_continuation` in [`protocol.py`](janedit/protocol.py).
+  `strip_hallucinated_continuation` in [`protocol.py`](local_edit/protocol.py).
 - **Can't run anything catastrophic.** `RUN` classifies every command:
   a read-only allowlist runs freely, a denylist (`rm -rf`, `sudo`, `mkfs`,
   `curl | sh`, `git push`, …) never runs at all, and everything else needs a
   yes. Commands run with `cwd` pinned to the project, `stdin` closed so they
   can't hang, a wall-clock timeout, and truncated output. See
-  [`shell.py`](janedit/shell.py).
+  [`shell.py`](local_edit/shell.py).
 - **Can't loop forever.** Repeated identical replies, off-task `TODO ADD`
   spam, and mid-stream repetition are all cut off; the todo queue is capped;
   a single `/work` call processes a bounded number of todos.
@@ -126,7 +126,7 @@ rewrites.
 | `/help`, `/quit`       |                                                   |
 
 Not using Jan? See [docs/custom-api.md](docs/custom-api.md) for pointing
-janedit at another OpenAI-compatible API.
+local-edit at another OpenAI-compatible API.
 
 ## Flags
 
@@ -140,7 +140,7 @@ automatically; override if you need more.
 ### How `RUN` flags interact with the command classifier
 
 Every `RUN` command is first classified `SAFE` / `NEEDS_APPROVAL` / `BLOCKED`
-(see [`shell.py`](janedit/shell.py)); these flags change what happens next,
+(see [`shell.py`](local_edit/shell.py)); these flags change what happens next,
 not the classification itself - a `BLOCKED` command never runs no matter
 what flags are set.
 
@@ -157,7 +157,7 @@ flag should be able to widen.
 
 ### Per-project command rules
 
-Drop `<project>/.janedit/command_rules.json` in a project to tune the
+Drop `<project>/.local-edit/command_rules.json` in a project to tune the
 classifier without editing source:
 
 ```json
@@ -175,9 +175,9 @@ otherwise be `SAFE` to `NEEDS_APPROVAL`.
 
 ## State
 
-Per project, under `<project>/.janedit/`: `session.json` (chat history + todo
+Per project, under `<project>/.local-edit/`: `session.json` (chat history + todo
 queue, so sessions survive restarts) and `backups/` (pre-edit copies, used by
-`/undo`). Model preferences are global, in `~/.janedit/config.json`.
+`/undo`). Model preferences are global, in `~/.local-edit/config.json`.
 
 ## Tests
 

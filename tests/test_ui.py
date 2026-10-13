@@ -3,14 +3,14 @@ import re
 
 from rich.console import Console
 
-from janedit import ui
+from local_edit import ui
 
 
 def test_prompt_wraps_ansi_in_readline_width_markers(monkeypatch):
     # The whole point: readline must be told which bytes take up no screen
     # columns, otherwise Backspace walks left over the prompt and erases it.
     monkeypatch.setattr(ui, "is_interactive", lambda: True)
-    monkeypatch.delenv("JANEDIT_PLAIN_PROMPT", raising=False)
+    monkeypatch.delenv("LOCAL_EDIT_PLAIN_PROMPT", raising=False)
 
     prompt = ui.build_prompt("you> ")
 
@@ -23,7 +23,7 @@ def test_prompt_wraps_ansi_in_readline_width_markers(monkeypatch):
 
 def test_visible_prompt_width_is_just_the_label(monkeypatch):
     monkeypatch.setattr(ui, "is_interactive", lambda: True)
-    monkeypatch.delenv("JANEDIT_PLAIN_PROMPT", raising=False)
+    monkeypatch.delenv("LOCAL_EDIT_PLAIN_PROMPT", raising=False)
 
     prompt = ui.build_prompt("you> ")
 
@@ -43,7 +43,7 @@ def test_visible_prompt_width_is_just_the_label(monkeypatch):
 
 def test_plain_prompt_env_var_disables_escapes(monkeypatch):
     monkeypatch.setattr(ui, "is_interactive", lambda: True)
-    monkeypatch.setenv("JANEDIT_PLAIN_PROMPT", "1")
+    monkeypatch.setenv("LOCAL_EDIT_PLAIN_PROMPT", "1")
     assert ui.build_prompt("you> ") == "you> "
 
 

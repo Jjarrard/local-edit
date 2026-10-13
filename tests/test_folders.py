@@ -4,7 +4,7 @@ Origin: asked to "create a new folder", Jan-v3.5-4B replied
 
     COMMAND: cd /Users/.../src && mkdir assets && ls -la
 
-Neither `cd` nor `mkdir` is a janedit keyword, so after the COMMAND: label
+Neither `cd` nor `mkdir` is a local-edit keyword, so after the COMMAND: label
 was stripped there was nothing to match - it fell through to chat and the
 turn ended silently with nothing created.
 """
@@ -14,10 +14,10 @@ import io
 import pytest
 from rich.console import Console
 
-from janedit import files, ui
-from janedit.agent import Agent
-from janedit.protocol import find_bare_shell_command, parse_action
-from janedit.state import Session
+from local_edit import files, ui
+from local_edit.agent import Agent
+from local_edit.protocol import find_bare_shell_command, parse_action
+from local_edit.state import Session
 
 
 # -- recognising an unlabelled shell command --------------------------------
@@ -60,7 +60,7 @@ def test_bare_shell_parses_as_a_run_action():
     assert action.text == "cd src && mkdir assets && ls -la"
 
 
-def test_a_real_janedit_keyword_still_wins():
+def test_a_real_local_edit_keyword_still_wins():
     # an explicit command must not be reinterpreted as shell
     assert parse_action("COMMAND: LIST src").kind == "LIST"
     assert parse_action("COMMAND: READ a.py").kind == "READ"
@@ -122,7 +122,7 @@ def test_folder_creation_still_asks_first(tmp_path, monkeypatch):
 
 
 def test_system_prompt_explains_folder_creation():
-    from janedit.protocol import build_system_prompt
+    from local_edit.protocol import build_system_prompt
 
     prompt = build_system_prompt("/project", allow_run=True)
     assert "folder" in prompt.lower()

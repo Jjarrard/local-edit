@@ -12,10 +12,10 @@ import io
 
 from rich.console import Console
 
-from janedit.agent import CHARS_PER_TOKEN, DEFAULT_CONTEXT_SIZE, Agent
-from janedit.client import ContextTooLargeError, _parse_context_error
-from janedit.protocol import build_system_prompt
-from janedit.state import Session
+from local_edit.agent import CHARS_PER_TOKEN, DEFAULT_CONTEXT_SIZE, Agent
+from local_edit.client import ContextTooLargeError, _parse_context_error
+from local_edit.protocol import build_system_prompt
+from local_edit.state import Session
 
 
 # -- parsing the server's complaint -----------------------------------------

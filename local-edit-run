@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Runs local-edit using this project's venv, from anywhere.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$DIR/.venv/bin/python" -m local_edit "$@"

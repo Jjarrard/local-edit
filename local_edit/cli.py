@@ -1,4 +1,4 @@
-"""Terminal chat app for janedit."""
+"""Terminal chat app for local-edit."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from rich.table import Table
 from . import completion, files, shell, ui
 from .agent import DEFAULT_CONTEXT_SIZE, Agent, ReviewAborted
 from .client import JanClient, JanConnectionError
-from .config import Config
+from .config import Config, config_dir, migrate_legacy_dir
 from .review import render_diff
 from .state import Session
 
@@ -41,7 +41,7 @@ SMALL_HINTS = ("0.5b", "1b", "1.5b", "2b", "3b", "mini", "small", "tiny")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="janedit", description=__doc__)
+    p = argparse.ArgumentParser(prog="local-edit", description=__doc__)
     p.add_argument("--base-url", default=None, help="Jan OpenAI-compatible API base URL")
     p.add_argument("--model", default=None, help="code model id (see /v1/models); remembered between runs")
     p.add_argument("--fast-model", default=None, help="small model for planning/review; defaults to the code model")
@@ -101,6 +101,9 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[bold red]project path does not exist: {root}[/bold red]")
         return 1
 
+    migrate_legacy_dir(config_dir())
+    migrate_legacy_dir(root / ".local-edit")
+
     cfg = Config.load()
     base_url = args.base_url or cfg.base_url
     client = JanClient(base_url=base_url, model="", temperature=args.temperature)
@@ -156,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         command_timeout=args.command_timeout,
     )
 
-    console.print(f"[bold]janedit[/bold]  {root}")
+    console.print(f"[bold]local-edit[/bold]  {root}")
     _print_status(console, agent, cfg, available)
     console.print("[dim]/help for commands, /model to switch models, or just chat.[/dim]")
     if agent.fast_model is None and len(available) > 1:

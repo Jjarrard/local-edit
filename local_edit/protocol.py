@@ -176,7 +176,7 @@ def parse_action(raw_text: str) -> Action:
 
     m = _CMD_LINE_RE.search(text)
     if not m:
-        # No janedit keyword - but the model may have written a bare shell
+        # No local-edit keyword - but the model may have written a bare shell
         # command ("COMMAND: mkdir assets", "$ ls", a ```bash block), which
         # is plainly an instruction to run something rather than chat.
         shell_command = find_bare_shell_command(text)
@@ -341,7 +341,7 @@ FORMAT_REMINDER = (
 _RUN_DOC = """  RUN <command>                 run a shell command (output comes back to you)
 """
 
-SYSTEM_PROMPT_TEMPLATE = """You are janedit, a coding assistant in the project at {root}.
+SYSTEM_PROMPT_TEMPLATE = """You are local-edit, a coding assistant in the project at {root}.
 
 Reply with ONE command and STOP. You will be shown its real result, then you send the
 next command. Never write the result yourself - never invent output or extra turns.

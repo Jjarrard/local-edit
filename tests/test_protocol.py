@@ -1,6 +1,6 @@
 import pytest
 
-from janedit.protocol import Action, ParseError, parse_action, parse_todo_adds
+from local_edit.protocol import Action, ParseError, parse_action, parse_todo_adds
 
 
 def test_say_is_the_default_when_no_command_found():

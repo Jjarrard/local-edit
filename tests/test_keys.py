@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from janedit import ui
+from local_edit import ui
 
 
 @pytest.mark.parametrize(

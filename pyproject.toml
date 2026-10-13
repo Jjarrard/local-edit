@@ -1,5 +1,5 @@
 [project]
-name = "janedit"
+name = "local-edit"
 version = "0.1.0"
 description = "A code-editing agent framework for tiny (1-3B) local models, hooked into Jan's local API."
 requires-python = ">=3.10"
@@ -9,11 +9,11 @@ dependencies = [
 ]
 
 [project.scripts]
-janedit = "janedit.cli:main"
+local-edit = "local_edit.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["janedit*"]
+include = ["local_edit*"]

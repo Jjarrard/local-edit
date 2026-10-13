@@ -1,6 +1,6 @@
 import pytest
 
-from janedit import files
+from local_edit import files
 
 
 @pytest.fixture

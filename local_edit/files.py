@@ -20,7 +20,7 @@ MAX_READ_LINES = 300
 MAX_LIST_ENTRIES = 300
 MAX_GREP_RESULTS = 60
 
-IGNORE_DIRS = {".git", ".janedit", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache"}
+IGNORE_DIRS = {".git", ".local-edit", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache"}
 
 
 class PathError(ValueError):

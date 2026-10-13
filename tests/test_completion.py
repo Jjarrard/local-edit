@@ -1,4 +1,4 @@
-from janedit.completion import candidates
+from local_edit.completion import candidates
 
 MODELS = [
     "Jan-code-4b-Q4_K_M",

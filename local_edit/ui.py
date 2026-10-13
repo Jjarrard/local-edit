@@ -33,7 +33,7 @@ CTRL_D = "\x04"
 
 
 def _plain_prompt_requested() -> bool:
-    return bool(os.environ.get("JANEDIT_PLAIN_PROMPT"))
+    return bool(os.environ.get("LOCAL_EDIT_PLAIN_PROMPT"))
 
 
 def is_interactive() -> bool:

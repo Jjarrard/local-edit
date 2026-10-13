@@ -5,9 +5,9 @@ import io
 
 from rich.console import Console
 
-from janedit.agent import Agent
-from janedit.review import REVIEW_MAX_TOKENS
-from janedit.state import Session
+from local_edit.agent import Agent
+from local_edit.review import REVIEW_MAX_TOKENS
+from local_edit.state import Session
 
 
 class RecordingClient:

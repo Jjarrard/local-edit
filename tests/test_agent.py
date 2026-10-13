@@ -2,10 +2,10 @@ import io
 
 from rich.console import Console
 
-from janedit.agent import Agent
-from janedit.client import JanConnectionError
-from janedit.protocol import parse_action
-from janedit.state import STATUS_BLOCKED, STATUS_PENDING, Session, TodoItem
+from local_edit.agent import Agent
+from local_edit.client import JanConnectionError
+from local_edit.protocol import parse_action
+from local_edit.state import STATUS_BLOCKED, STATUS_PENDING, Session, TodoItem
 
 
 class BrokenClient:
@@ -193,7 +193,7 @@ def test_messages_never_start_with_assistant_after_trimming(tmp_path):
     # since every session starts with "user") loses its leading "user" entry
     # when trimmed to an even MAX_HISTORY_MESSAGES window, leaving an
     # orphaned "assistant" reply at the front.
-    from janedit.agent import MAX_HISTORY_MESSAGES
+    from local_edit.agent import MAX_HISTORY_MESSAGES
 
     agent, session = _agent(tmp_path)
     for i in range(MAX_HISTORY_MESSAGES + 5):

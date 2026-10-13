@@ -2,7 +2,7 @@ import sys
 
 import pytest
 
-from janedit import shell
+from local_edit import shell
 
 
 @pytest.mark.parametrize(
@@ -71,32 +71,32 @@ def test_docker_and_kubectl_mutating_subcommands_need_approval(command):
 
 
 def test_project_deny_list_escalates_an_otherwise_safe_program(tmp_path):
-    (tmp_path / ".janedit").mkdir()
-    (tmp_path / ".janedit" / "command_rules.json").write_text('{"deny_programs": ["cat"]}')
+    (tmp_path / ".local-edit").mkdir()
+    (tmp_path / ".local-edit" / "command_rules.json").write_text('{"deny_programs": ["cat"]}')
     assert shell.classify("cat secret.txt", root=tmp_path).verdict == shell.NEEDS_APPROVAL
 
 
 def test_project_allow_list_marks_an_unknown_program_safe(tmp_path):
-    (tmp_path / ".janedit").mkdir()
-    (tmp_path / ".janedit" / "command_rules.json").write_text('{"allow_programs": ["mytool"]}')
+    (tmp_path / ".local-edit").mkdir()
+    (tmp_path / ".local-edit" / "command_rules.json").write_text('{"allow_programs": ["mytool"]}')
     assert shell.classify("mytool --check", root=tmp_path).verdict == shell.SAFE
 
 
 def test_project_allow_subcommands(tmp_path):
-    (tmp_path / ".janedit").mkdir()
-    (tmp_path / ".janedit" / "command_rules.json").write_text('{"allow_subcommands": {"docker": ["build"]}}')
+    (tmp_path / ".local-edit").mkdir()
+    (tmp_path / ".local-edit" / "command_rules.json").write_text('{"allow_subcommands": {"docker": ["build"]}}')
     assert shell.classify("docker build .", root=tmp_path).verdict == shell.SAFE
 
 
 def test_project_allow_list_cannot_override_hard_blocks(tmp_path):
-    (tmp_path / ".janedit").mkdir()
-    (tmp_path / ".janedit" / "command_rules.json").write_text('{"allow_programs": ["rm"]}')
+    (tmp_path / ".local-edit").mkdir()
+    (tmp_path / ".local-edit" / "command_rules.json").write_text('{"allow_programs": ["rm"]}')
     assert shell.classify("rm -rf /", root=tmp_path).verdict == shell.BLOCKED
 
 
 def test_malformed_command_rules_file_is_ignored(tmp_path):
-    (tmp_path / ".janedit").mkdir()
-    (tmp_path / ".janedit" / "command_rules.json").write_text("not json{{{")
+    (tmp_path / ".local-edit").mkdir()
+    (tmp_path / ".local-edit" / "command_rules.json").write_text("not json{{{")
     assert shell.classify("ls", root=tmp_path).verdict == shell.SAFE
 
 

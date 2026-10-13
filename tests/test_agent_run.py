@@ -5,10 +5,10 @@ import io
 import pytest
 from rich.console import Console
 
-from janedit import ui
-from janedit.agent import Agent, ReviewAborted
-from janedit.protocol import parse_action
-from janedit.state import Session
+from local_edit import ui
+from local_edit.agent import Agent, ReviewAborted
+from local_edit.protocol import parse_action
+from local_edit.state import Session
 
 
 class DummyClient:

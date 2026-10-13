@@ -1,4 +1,4 @@
-from janedit.review import self_review
+from local_edit.review import self_review
 
 
 class FakeClient:

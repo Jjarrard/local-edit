@@ -19,9 +19,9 @@ import io
 import pytest
 from rich.console import Console
 
-from janedit.agent import Agent
-from janedit.protocol import parse_action
-from janedit.state import Session
+from local_edit.agent import Agent
+from local_edit.protocol import parse_action
+from local_edit.state import Session
 
 BLOCK = "```html\n<!DOCTYPE html>\n<html></html>\n```"
 

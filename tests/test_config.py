@@ -2,12 +2,12 @@ import json
 
 import pytest
 
-from janedit.config import Config, config_path
+from local_edit.config import Config, config_path, migrate_legacy_dir
 
 
 @pytest.fixture(autouse=True)
 def isolated_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("JANEDIT_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setenv("LOCAL_EDIT_CONFIG_DIR", str(tmp_path / "cfg"))
 
 
 def test_defaults_when_no_file_exists():
@@ -87,3 +87,20 @@ def test_save_is_atomic_and_leaves_no_temp_file():
     cfg.save()
     leftovers = list(config_path().parent.glob("*.tmp"))
     assert leftovers == []
+
+
+def test_legacy_janedit_dir_is_moved(tmp_path):
+    (tmp_path / ".janedit").mkdir()
+    (tmp_path / ".janedit" / "session.json").write_text("{}")
+    migrate_legacy_dir(tmp_path / ".local-edit")
+    assert not (tmp_path / ".janedit").exists()
+    assert (tmp_path / ".local-edit" / "session.json").read_text() == "{}"
+
+
+def test_legacy_dir_never_overwrites_new_one(tmp_path):
+    (tmp_path / ".janedit").mkdir()
+    (tmp_path / ".local-edit").mkdir()
+    (tmp_path / ".local-edit" / "keep").write_text("new")
+    migrate_legacy_dir(tmp_path / ".local-edit")
+    assert (tmp_path / ".janedit").exists()
+    assert (tmp_path / ".local-edit" / "keep").read_text() == "new"

@@ -1,6 +1,6 @@
 """Todo queue and session persistence.
 
-Everything lives under <project>/.janedit/ so a session (todos + chat
+Everything lives under <project>/.local-edit/ so a session (todos + chat
 history) survives across restarts of the terminal app.
 """
 
@@ -82,7 +82,7 @@ class Session:
 
     def __init__(self, project_root: Path):
         self.project_root = project_root
-        self.state_dir = project_root / ".janedit"
+        self.state_dir = project_root / ".local-edit"
         self.backup_dir = self.state_dir / "backups"
         self.history: list[dict] = []  # chat messages excluding the system prompt
         self.todos = TodoStore()

@@ -1,7 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
-.janedit/
+.local-edit/
 *.egg-info/
 .pytest_cache/
 .DS_Store
