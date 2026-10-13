@@ -25,7 +25,7 @@ That's it — no venv activation, no flags. It picks up your last-used model,
 talks to Jan, and edits files in place. Make it a bare command:
 
 ```bash
-echo 'alias janedit="/Users/jamesjarrard/Desktop/code/local-code/janedit-run"' >> ~/.zshrc
+echo 'alias janedit="/Users/YOU/Desktop/code/local-code/janedit-run"' >> ~/.zshrc
 ```
 
 ## Switching models
