@@ -4,3 +4,4 @@ __pycache__/
 .janedit/
 *.egg-info/
 .pytest_cache/
+.DS_Store

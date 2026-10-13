@@ -11,21 +11,24 @@ the harness has to be the thing that's correct**.
 
 ## Run it
 
+Setting up from scratch:
+
 ```bash
-janedit --project ~/Desktop/code/testing-jan2
+python3 -m venv .venv && .venv/bin/pip install -e .
 ```
 
-Or via the wrapper script:
+Then run it via the wrapper script:
 
 ```bash
 ./janedit-run --project /path/to/your/code
 ```
 
 That's it — no venv activation, no flags. It picks up your last-used model,
-talks to Jan, and edits files in place. Make it a bare command:
+talks to Jan, and edits files in place. Make it a bare command (run this from
+inside the repo folder):
 
 ```bash
-echo 'alias janedit="/Users/YOU/Desktop/code/local-code/janedit-run"' >> ~/.zshrc
+echo "alias janedit=\"$(pwd)/janedit-run\"" >> ~/.zshrc
 ```
 
 ## Switching models
