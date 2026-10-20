@@ -176,8 +176,11 @@ otherwise be `SAFE` to `NEEDS_APPROVAL`.
 ## State
 
 Per project, under `<project>/.local-edit/`: `session.json` (chat history + todo
-queue, so sessions survive restarts) and `backups/` (pre-edit copies, used by
-`/undo`). Model preferences are global, in `~/.local-edit/config.json`.
+queue) and `backups/` (pre-edit copies, used by `/undo`). Todos and `/undo`
+survive restarts; the chat starts fresh each launch, because a small model
+re-reading its own failed attempts tends to repeat them - pass `--resume` to
+continue the previous chat. Model preferences are global, in
+`~/.local-edit/config.json`.
 
 ## Tests
 

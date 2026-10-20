@@ -30,3 +30,22 @@ def test_todostore_caps_at_max_todos(tmp_path):
         session.todos.add(f"todo {i}")
     assert len(session.todos.items) == MAX_TODOS
     assert session.todos.add("one more") is None
+
+
+def test_load_can_skip_chat_history_but_keeps_todos(tmp_path):
+    from local_edit.state import Session
+
+    first = Session(tmp_path)
+    first.add_message("user", "make a website")
+    first.add_message("assistant", "EDIT index.html 1-76 ...")
+    first.todos.add("finish the footer")
+    first.save()
+
+    fresh = Session(tmp_path)
+    assert fresh.load(include_history=False) == 2
+    assert fresh.history == []
+    assert [t.text for t in fresh.todos.items] == ["finish the footer"]
+
+    resumed = Session(tmp_path)
+    resumed.load()
+    assert len(resumed.history) == 2

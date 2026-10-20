@@ -92,16 +92,25 @@ class Session:
     def state_file(self) -> Path:
         return self.state_dir / "session.json"
 
-    def load(self) -> None:
+    def load(self, include_history: bool = True) -> int:
+        """Restore saved state. Returns how many saved chat messages there were.
+
+        With include_history=False the chat starts empty but todos and the
+        /undo journal still come back: a small model reading its own failed
+        attempts from last time tends to repeat them, so a fresh launch
+        shouldn't resume the conversation unless asked to.
+        """
         if not self.state_file.exists():
-            return
+            return 0
         try:
             data = json.loads(self.state_file.read_text())
         except (json.JSONDecodeError, OSError):
-            return
-        self.history = data.get("history", [])
+            return 0
+        saved_history = data.get("history", [])
+        self.history = saved_history if include_history else []
         self.todos = TodoStore.from_dict(data.get("todos", {}))
         self.applied_edits = data.get("applied_edits", [])
+        return len(saved_history)
 
     def save(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)

@@ -67,6 +67,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm-all-commands", action="store_true", help="ask before even read-only commands")
     p.add_argument("--command-timeout", type=int, default=shell.DEFAULT_TIMEOUT, help="seconds before a RUN is killed")
     p.add_argument("--goal", default=None, help="start immediately in autonomous /work mode with this goal")
+    p.add_argument("--resume", action="store_true", help="continue the previous chat instead of starting fresh")
     return p
 
 
@@ -97,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     console = Console()
     root = Path(args.project).resolve()
+    if root == Path.home().resolve() and args.project == "." and ui.is_interactive():
+        root = _ask_for_project_dir(console) or root
     if not root.exists():
         console.print(f"[bold red]project path does not exist: {root}[/bold red]")
         return 1
@@ -142,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg.save()
 
     session = Session(root)
-    session.load()
+    saved_messages = session.load(include_history=args.resume)
 
     agent = Agent(
         client=client,
@@ -160,7 +163,18 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     console.print(f"[bold]local-edit[/bold]  {root}")
+    if root == Path.home().resolve():
+        # Double-clicking local-edit-run in Finder starts it in the home
+        # folder, so every new file lands loose in ~ and LIST walks all of it.
+        console.print(
+            "[bold yellow]warning: the project folder is your home directory - new files will be "
+            "created directly in it. Quit and cd into a project folder (or pass --project <dir>) "
+            "first.[/bold yellow]"
+        )
     _print_status(console, agent, cfg, available)
+    if saved_messages and not args.resume:
+        console.print(f"[dim]started a fresh chat ({saved_messages} messages from last time not loaded - "
+                      f"relaunch with --resume to continue it).[/dim]")
     console.print("[dim]/help for commands, /model to switch models, or just chat.[/dim]")
     if agent.fast_model is None and len(available) > 1:
         console.print("[dim]tip: /fast <model> sends planning and review to a smaller model.[/dim]")
@@ -189,16 +203,44 @@ def main(argv: list[str] | None = None) -> int:
                     break
             except ReviewAborted:
                 console.print("[yellow]stopped[/yellow]")
+            except KeyboardInterrupt:
+                console.print("\n[yellow]interrupted[/yellow]")
             continue
 
         try:
             agent.chat_turn(text)
         except ReviewAborted:
             console.print("[yellow]stopped[/yellow]")
+        except KeyboardInterrupt:
+            # Ctrl-C stops the model's current reply, not the whole app.
+            console.print("\n[yellow]interrupted - back to you (Ctrl-C again at the prompt to quit)[/yellow]")
 
     session.save()
     console.print("bye.")
     return 0
+
+
+DEFAULT_WORKSPACE = "~/local-edit-projects"
+
+
+def _ask_for_project_dir(console: Console) -> Path | None:
+    """Started from the home folder (e.g. by double-clicking local-edit-run in
+    Finder): ask where to work instead of scattering files across ~ and
+    colliding with whatever a previous session left there."""
+    console.print("[yellow]You're in your home folder. Which folder should local-edit work in?[/yellow]")
+    try:
+        answer = ui.ask_line(f"folder [{DEFAULT_WORKSPACE}]> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    chosen = Path(answer or DEFAULT_WORKSPACE).expanduser()
+    if not chosen.is_absolute():
+        chosen = Path(DEFAULT_WORKSPACE).expanduser() / chosen
+    try:
+        chosen.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        console.print(f"[red]couldn't create {chosen}: {exc}[/red]")
+        return None
+    return chosen.resolve()
 
 
 def _print_status(console: Console, agent: Agent, cfg: Config, available: list[str]) -> None:
