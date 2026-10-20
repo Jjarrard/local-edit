@@ -84,8 +84,11 @@ def _parse_range(spec: str, label: str) -> tuple[int, int]:
         m = re.match(r"^(\d+)$", spec)
         if not m:
             raise ParseError(f"expected a line range like 12-14 for {label}, got '{spec}'")
-        return int(m.group(1)), int(m.group(1))
-    return int(m.group(1)), int(m.group(2))
+        n = max(1, int(m.group(1)))
+        return n, n
+    # Lines are 1-indexed, but models routinely say 0 for "the top"
+    # (EDIT index.html 0-53). Read that as line 1 rather than failing.
+    return max(1, int(m.group(1))), max(1, int(m.group(2)))
 
 
 # Markers that mean the model stopped issuing a command and started
@@ -163,6 +166,27 @@ def find_bare_shell_command(text: str) -> str | None:
     return None
 
 
+_FILE_COMMANDS = ("EDIT", "INSERT", "DELETE")
+
+
+def _later_file_command(text: str, from_pos: int) -> Action | None:
+    """The first EDIT/INSERT/DELETE after `from_pos` that sits outside a code
+    block and parses cleanly, with everything before it as the preamble."""
+    for later in _CMD_LINE_RE.finditer(text, from_pos):
+        if later.group(1).upper() not in _FILE_COMMANDS:
+            continue
+        if text.count("```", 0, later.start()) % 2:
+            continue  # inside a fence - e.g. a SQL "DELETE FROM" line
+        try:
+            action = parse_action(text[later.start():])
+        except ParseError:
+            continue
+        action.preamble = text[: later.start()].strip()
+        action.raw = text
+        return action
+    return None
+
+
 def parse_action(raw_text: str) -> Action:
     """Parse the first recognized command out of a model response.
 
@@ -190,6 +214,13 @@ def parse_action(raw_text: str) -> Action:
     after_cmd = text[m.end() :]
 
     if keyword == "SAY":
+        # "SAY I'll create the page.\n\nINSERT index.html 0\n```..." is one
+        # command, not chat: the SAY is narration in front of the real
+        # action. Treating it as chat throws away the whole file the model
+        # just spent its budget writing.
+        file_action = _later_file_command(text, m.end())
+        if file_action is not None:
+            return file_action
         message = (rest_of_line + "\n" + after_cmd).strip()
         return Action(kind="SAY", preamble=preamble, text=message or "(empty)", raw=raw_text)
 
@@ -210,11 +241,11 @@ def parse_action(raw_text: str) -> Action:
         if len(parts) > 1:
             range_m = re.match(r"^(\d+)\s*-\s*(\d+)$", parts[1])
             if range_m:
-                start, end = int(range_m.group(1)), int(range_m.group(2))
+                start, end = max(1, int(range_m.group(1))), max(1, int(range_m.group(2)))
             elif parts[1].isdigit():
-                start = int(parts[1])
+                start = max(1, int(parts[1]))
                 if len(parts) > 2 and parts[2].isdigit():
-                    end = int(parts[2])
+                    end = max(1, int(parts[2]))
         return Action(kind="READ", preamble=preamble, path=path, start=start, end=end, raw=raw_text)
 
     if keyword == "GREP":
