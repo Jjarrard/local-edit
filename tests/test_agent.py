@@ -35,7 +35,8 @@ def test_say_with_code_block_gets_pushed_to_redo_as_real_edit(tmp_path):
 
     assert finished is False
     assert result_text is not None
-    assert "doesn't write anything to disk" in result_text
+    assert "NOT saved" in result_text
+    assert agent._held_code == "print('hi')"
 
 
 def test_say_without_code_block_still_ends_chat_turn(tmp_path):

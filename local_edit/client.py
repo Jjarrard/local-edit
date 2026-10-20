@@ -62,6 +62,9 @@ class JanClient:
     temperature: float = 0.2
     max_tokens: int = 512
     timeout: float = 120.0
+    # Why the last stream_chat() stopped ("stop", "length", ...), or None if
+    # the server never said. "length" means the reply hit max_tokens.
+    last_finish_reason: str | None = None
 
     def _headers(self) -> dict:
         return {
@@ -124,6 +127,10 @@ class JanClient:
                 f"Jan rejected the request ({resp.status_code}) at {url}: {body[:500] or '(no body)'}"
             )
 
+        # SSE responses usually omit a charset, and requests then falls back
+        # to Latin-1 - which turns every emoji or accented letter into mojibake.
+        resp.encoding = "utf-8"
+        self.last_finish_reason = None
         try:
             for raw_line in resp.iter_lines(decode_unicode=True):
                 if not raw_line:
@@ -140,6 +147,8 @@ class JanClient:
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
+                if choices[0].get("finish_reason"):
+                    self.last_finish_reason = choices[0]["finish_reason"]
                 delta = choices[0].get("delta") or {}
                 piece = delta.get("content")
                 if piece:

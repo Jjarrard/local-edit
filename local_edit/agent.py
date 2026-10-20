@@ -10,6 +10,7 @@ Two modes share the same step machinery:
 from __future__ import annotations
 
 import contextlib
+import re
 from pathlib import Path
 
 from rich.console import Console
@@ -46,6 +47,43 @@ DEFAULT_CONTEXT_SIZE = 4096
 CHARS_PER_TOKEN = 4  # rough but stable enough for budgeting
 CONTEXT_SAFETY_TOKENS = 192  # chat-template overhead, BOS tokens, rounding
 MIN_HISTORY_CHARS = 800  # always leave room for the current request
+
+
+_FENCED_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+
+MAX_CONTINUATIONS = 4  # one reply can grow to (1 + this) x max_tokens
+
+
+def _drop_echo(pieces, prefix: str):
+    """Yield streamed pieces minus a leading copy of `prefix`, if any.
+
+    Servers differ on prefill: llama.cpp's own server streams only the new
+    text, Jan streams the prefill back first. Buffer until it's clear which
+    this is, then pass everything after the echo through untouched.
+    """
+    if not prefix:
+        yield from pieces
+        return
+    buf = ""
+    matching = True
+    for piece in pieces:
+        if not matching:
+            yield piece
+            continue
+        buf += piece
+        if len(buf) < len(prefix):
+            if prefix.startswith(buf):
+                continue
+            matching = False
+            yield buf
+        elif buf.startswith(prefix):
+            matching = False
+            if buf[len(prefix):]:
+                yield buf[len(prefix):]
+        else:
+            matching = False
+            yield buf
+    # A stream that ended while still matching was only the echo - nothing new.
 
 
 def _signature(text: str) -> str:
@@ -96,6 +134,10 @@ class Agent:
         self.validation_failures = 0
         self.review_rejections = 0
         self.edits_applied = 0
+        self._last_stream_aborted = False
+        # Code the model wrote in a chat message instead of a file command,
+        # waiting for it to say where it goes (see _hold_code_from_chat).
+        self._held_code: str | None = None
 
     @property
     def code_model(self) -> str:
@@ -103,23 +145,24 @@ class Agent:
 
     # -- model I/O -----------------------------------------------------
 
-    def _history_budget_chars(self, system_prompt: str) -> int:
+    def _history_budget_chars(self, system_prompt: str, reserve_chars: int = 0) -> int:
         """How much history fits, given the context window and the space the
         reply itself needs. Everything the server must hold at once - system
         prompt, history, and the tokens it is about to generate - has to fit
-        inside context_size."""
+        inside context_size. `reserve_chars` holds back room for a partial
+        reply being sent back for continuation."""
         system_tokens = len(system_prompt) // CHARS_PER_TOKEN
         reply_tokens = getattr(self.client, "max_tokens", 512)
         reserved = system_tokens + reply_tokens + CONTEXT_SAFETY_TOKENS
-        available = (self.context_size - reserved) * CHARS_PER_TOKEN
+        available = (self.context_size - reserved) * CHARS_PER_TOKEN - reserve_chars
         return max(MIN_HISTORY_CHARS, available)
 
-    def _messages(self) -> list[dict]:
+    def _messages(self, reserve_chars: int = 0) -> list[dict]:
         system_prompt = build_system_prompt(str(self.root), allow_run=self.allow_run)
         system = {"role": "system", "content": system_prompt}
         candidates = self.session.history[-MAX_HISTORY_MESSAGES:]
         kept: list[dict] = []
-        budget = self._history_budget_chars(system_prompt)
+        budget = self._history_budget_chars(system_prompt, reserve_chars)
         for msg in reversed(candidates):
             cost = len(msg.get("content", ""))
             if kept and cost > budget:
@@ -132,7 +175,7 @@ class Agent:
         # command output). Truncate the middle of the oldest kept message
         # rather than letting the request fail outright.
         if kept:
-            limit = self._history_budget_chars(system_prompt)
+            limit = self._history_budget_chars(system_prompt, reserve_chars)
             overflow = sum(len(m.get("content", "")) for m in kept) - limit
             if overflow > 0:
                 first = dict(kept[0])
@@ -158,16 +201,22 @@ class Agent:
     # models) that it's worth cutting the connection early rather than
     # waiting out the full max_tokens budget and then blowing the context
     # window with garbage.
-    REPEAT_LINE_LIMIT = 5
+    # Real code repeats lines legitimately - five product cards means five
+    # identical `<div class="card">` lines - so only a run of the same line
+    # back to back, or one line recurring far more than code ever does, counts.
+    REPEAT_RUN_LIMIT = 5
+    REPEAT_TOTAL_LIMIT = 30
     REPEAT_LINE_MIN_LEN = 8
 
     def _stream_and_print(
         self,
         messages: list[dict],
-        label: str = "model",
+        label: str | None = "model",
         max_tokens: int | None = None,
         model: str | None = None,
         waiting_message: str = "thinking",
+        echo_prefix: str = "",
+        strip: bool = True,
     ) -> str:
         """Stream a completion, printing it live and cutting it off early if
         it gets stuck repeating a line.
@@ -175,9 +224,15 @@ class Agent:
         A spinner covers the dead air before the first token (which on a
         local model can be many seconds of prompt processing), then stops the
         instant real output arrives so it never fights with the stream.
+
+        `echo_prefix` is a prefilled assistant message some servers (Jan
+        among them) stream back before the continuation; it is dropped so
+        only new text is printed and returned.
         """
         pieces: list[str] = []
         line_counts: dict[str, int] = {}
+        last_line = None
+        run_length = 0
         buffer_line = ""
         aborted = False
         started = False
@@ -185,23 +240,28 @@ class Agent:
         spinner = ui.status(self.console, f"{waiting_message} ({which})")
         spinner_cm = spinner.__enter__()
         try:
-            for piece in self.client.stream_chat(messages, max_tokens=max_tokens, model=model):
+            stream = self.client.stream_chat(messages, max_tokens=max_tokens, model=model)
+            for piece in _drop_echo(stream, echo_prefix):
                 if not started:
                     spinner.__exit__(None, None, None)
                     spinner_cm = None
                     started = True
-                    self.console.print(f"[bold cyan]{label}>[/bold cyan] ", end="")
+                    if label:
+                        self.console.print(f"[bold cyan]{label}>[/bold cyan] ", end="")
                 pieces.append(piece)
                 self.console.print(piece, end="", markup=False, highlight=False)
                 buffer_line += piece
                 while "\n" in buffer_line:
                     line, buffer_line = buffer_line.split("\n", 1)
                     norm = line.strip().lower()
-                    if len(norm) >= self.REPEAT_LINE_MIN_LEN:
-                        line_counts[norm] = line_counts.get(norm, 0) + 1
-                        if line_counts[norm] >= self.REPEAT_LINE_LIMIT:
-                            aborted = True
-                            break
+                    if len(norm) < self.REPEAT_LINE_MIN_LEN:
+                        continue
+                    run_length = run_length + 1 if norm == last_line else 1
+                    last_line = norm
+                    line_counts[norm] = line_counts.get(norm, 0) + 1
+                    if run_length >= self.REPEAT_RUN_LIMIT or line_counts[norm] >= self.REPEAT_TOTAL_LIMIT:
+                        aborted = True
+                        break
                 if aborted:
                     break
         finally:
@@ -212,9 +272,11 @@ class Agent:
                     spinner.__exit__(None, None, None)
             if started:
                 self.console.print()
+        self._last_stream_aborted = aborted
         if aborted:
             self.console.print("[yellow](cut off: model got stuck repeating a line)[/yellow]")
-        return "".join(pieces).strip()
+        text = "".join(pieces)
+        return text.strip() if strip else text
 
     def _adapt_to_context(self, exc: ContextTooLargeError) -> bool:
         """Learn the model's real window from the server's complaint.
@@ -246,11 +308,44 @@ class Agent:
     def _model_turn(self) -> str:
         for attempt in range(3):
             try:
-                return self._stream_and_print(self._messages(), label="model", waiting_message="thinking")
+                return self._generate_with_continuations()
             except ContextTooLargeError as exc:
                 if attempt == 2 or not self._adapt_to_context(exc):
                     raise
         raise AssertionError("unreachable")
+
+    def _generate_with_continuations(self) -> str:
+        """One model reply, stitched across the max_tokens limit if needed.
+
+        A small reply budget routinely cuts a whole-file INSERT off mid-block.
+        When that happens, the partial reply is sent back as the start of the
+        assistant's own message (a prefill), so the model carries on from the
+        exact character it stopped at, and the pieces are joined. Only an
+        open code block is continued - a cut-off sentence of chat isn't worth
+        another round-trip.
+        """
+        text = self._stream_and_print(
+            self._messages(), label="model", waiting_message="thinking", strip=False
+        )
+        for _ in range(MAX_CONTINUATIONS):
+            if getattr(self.client, "last_finish_reason", None) != "length":
+                break
+            if self._last_stream_aborted or text.count("```") % 2 == 0:
+                break
+            # The partial reply rides along in the prompt; stop before it
+            # crowds out the conversation the model needs to finish it.
+            if len(text) > self.context_size * CHARS_PER_TOKEN // 2:
+                break
+            self.console.print("[dim](hit the reply length limit - continuing...)[/dim]")
+            messages = self._messages(reserve_chars=len(text))
+            messages.append({"role": "assistant", "content": text})
+            more = self._stream_and_print(
+                messages, label=None, waiting_message="continuing", echo_prefix=text, strip=False
+            )
+            if not more.strip():
+                break
+            text += more
+        return text.strip()
 
     def _run_self_review(self, task_text: str, rel: str, before: str, after: str) -> tuple[bool, str]:
         try:
@@ -294,16 +389,22 @@ class Agent:
         try:
             action = parse_action(raw)
         except ParseError as exc:
-            msg = FORMAT_REMINDER.format(error=str(exc))
-            self.session.add_message("user", msg)
-            self.console.print(f"[red]parse error:[/red] {exc}")
-            return False, "parse_error", raw
+            action = self._attach_held_code(raw)
+            if action is None:
+                msg = FORMAT_REMINDER.format(error=str(exc))
+                self.session.add_message("user", msg)
+                self.console.print(f"[red]parse error:[/red] {exc}")
+                return False, "parse_error", raw
 
         # The reply was already streamed to the terminal as it arrived, so
         # neither the preamble nor a SAY body gets echoed a second time.
 
         result_text, finished = self._handle_action(action, active_todo)
         if result_text is not None:
+            if result_text.startswith("ERROR:"):
+                # The model sees every error; the user should too, or a run of
+                # failed commands just looks like the model ignoring them.
+                self.console.print(f"[red]{result_text.splitlines()[0]}[/red]", markup=False)
             self.session.add_message("user", result_text)
         return finished, action.kind, raw
 
@@ -312,17 +413,7 @@ class Agent:
 
         if kind == "SAY":
             if "```" in action.text:
-                # A small model that meant to write/change a file often just
-                # narrates and dumps the code in chat instead of using a real
-                # file command. That code never gets written anywhere, so
-                # push it to redo the same content as an actual INSERT/EDIT.
-                return (
-                    "That message contained a code block, but SAY doesn't write anything to "
-                    "disk. If you meant to create or change a file, resend that code as "
-                    "INSERT <path> <line> (new file or new lines) or EDIT <path> <start>-<end> "
-                    "(existing lines), with the code in a fenced block.",
-                    False,
-                )
+                return self._hold_code_from_chat(action), False
             if active_todo is not None:
                 return (
                     "Continue working on the active task. Use READ/GREP to inspect code, "
@@ -388,21 +479,114 @@ class Agent:
 
     # -- edits: plan -> review -> apply -----------------------------------------------------
 
+    # -- code written as chat -----------------------------------------------------
+
+    def _hold_code_from_chat(self, action: Action) -> str:
+        """Keep the code from a chat message so it needn't be written twice.
+
+        A small model that means to create a file often narrates and dumps
+        the code in chat instead of sending INSERT/EDIT. Asking it to resend
+        the code costs another full generation - and with two copies of a
+        page in history, a 4k context is full and the retry fails. So hold
+        the largest block here, shrink it to a placeholder in history, and
+        ask only for the command line; _attach_held_code supplies the code.
+        """
+        blocks = list(_FENCED_BLOCK_RE.finditer(action.raw))
+        largest = max(blocks, key=lambda b: len(b.group(1))) if blocks else None
+        code = largest.group(1).rstrip("\n") if largest else ""
+        if not code.strip():
+            return (
+                "That message contained a code block, but SAY doesn't write anything to disk. "
+                "Use INSERT or EDIT with the code in a fenced block."
+            )
+        self._held_code = code
+        n_lines = len(code.splitlines())
+        last = self.session.history[-1] if self.session.history else None
+        if last and last["role"] == "assistant":
+            placeholder = f"(code block of {n_lines} lines - held, not saved yet)"
+            last["content"] = last["content"].replace(largest.group(0), placeholder, 1)
+        self.console.print(f"[yellow]holding the {n_lines}-line code block - asking where to save it[/yellow]")
+        return (
+            f"That code ({n_lines} lines) was NOT saved - SAY doesn't write files. It is being held "
+            "for you, so do NOT write it again. Reply with ONLY the command line, no code block:\n"
+            "  INSERT <path> 0            to save it as a new file\n"
+            "  EDIT <path> <start>-<end>  to replace those lines with it\n"
+            "The held code will be used as the content."
+        )
+
+    def _attach_held_code(self, raw: str) -> Action | None:
+        """A bare `INSERT path 0` / `EDIT path a-b` after code was held:
+        pair the command with that code instead of failing to parse."""
+        if not self._held_code:
+            return None
+        line = raw.strip().splitlines()[0] if raw.strip() else ""
+        if "```" in raw or not re.match(r"^\W*(INSERT|EDIT)\s+\S+\s+\d", line, re.IGNORECASE):
+            return None
+        try:
+            action = parse_action(f"{line}\n```\n{self._held_code}\n```")
+        except ParseError:
+            return None
+        self.console.print("[dim](using the held code block)[/dim]")
+        self._held_code = None
+        return action
+
+    def _as_whole_file_rewrite(self, action: Action) -> Action:
+        """Turn `INSERT <existing file> 0` carrying a whole new file into a
+        replace of the entire file.
+
+        A model that doesn't know the file exists writes the full page as an
+        INSERT at the top, which stacks it above the old content (two
+        <html> documents in one file). When the payload opens with the same
+        line the file does - "<!DOCTYPE html>", "import ...", a shebang -
+        it's a rewrite, so replace instead of prepend. The diff and the
+        approval prompt still show exactly what happens.
+        """
+        if action.kind != "INSERT" or action.start != 0 or not action.payload:
+            return action
+        try:
+            target = files.resolve(self.root, action.path)
+        except files.PathError:
+            return action
+        if not target.is_file():
+            return action
+        try:
+            current = target.read_text()
+        except (OSError, UnicodeDecodeError):
+            return action
+        first_current = next((ln.strip() for ln in current.splitlines() if ln.strip()), None)
+        first_new = next((ln.strip() for ln in action.payload.splitlines() if ln.strip()), None)
+        if not first_current or first_current != first_new:
+            return action
+        line_count = len(current.splitlines())
+        self.console.print(
+            f"[yellow]{action.path} already exists - treating this as a rewrite of all "
+            f"{line_count} lines, not an insert above them[/yellow]"
+        )
+        action.kind, action.start, action.end = "EDIT", 1, line_count
+        return action
+
     def _handle_write(self, action: Action, active_todo) -> tuple[str | None, bool]:
+        action = self._as_whole_file_rewrite(action)
         try:
             if action.kind == "EDIT":
                 if action.payload_truncated:
+                    self.console.print("[red]not applied:[/red] reply hit the length limit mid-block")
                     return (
-                        "ERROR: your replacement block was cut off (no closing ```). "
-                        "Send a shorter EDIT.",
+                        "ERROR: your replacement block was cut off (no closing ```) - replies are "
+                        f"limited to about {self.client.max_tokens} tokens. The file was NOT changed. "
+                        "Do not resend the whole file: EDIT only the few lines that need to change.",
                         False,
                     )
                 result = files.plan_replace(self.root, action.path, action.start, action.end, action.payload)
             elif action.kind == "INSERT":
                 if action.payload_truncated:
+                    self.console.print("[red]not applied:[/red] reply hit the length limit mid-block")
                     return (
-                        "ERROR: your inserted block was cut off (no closing ```). "
-                        "Send a shorter INSERT.",
+                        "ERROR: your inserted block was cut off (no closing ```) - replies are "
+                        f"limited to about {self.client.max_tokens} tokens. The file was NOT changed. "
+                        "Write it in parts: INSERT the first part now, then INSERT the rest after "
+                        "its last line in the next command. For a web page, put the CSS in its own "
+                        "file (style.css) so each part stays short.",
                         False,
                     )
                 result = files.plan_insert(self.root, action.path, action.start, action.payload)
@@ -410,6 +594,17 @@ class Agent:
                 result = files.plan_delete(self.root, action.path, action.start, action.end)
         except files.PathError as exc:
             return f"ERROR: {exc}", False
+
+        # A no-op edit has nothing to review or approve. Without this, the
+        # "identical retry gets applied" escape hatch below turns a model
+        # resending the current file into an endless approve-nothing loop.
+        if result.old_text == result.new_text:
+            self.console.print(f"[yellow]no change:[/yellow] {result.rel} already has that content")
+            return (
+                f"No change: {result.rel} already contains exactly that. Do not resend it. "
+                f"If the task needs new content, EDIT/INSERT only the new lines.",
+                False,
+            )
 
         # Structural check before anything else: a syntactically broken edit
         # is never worth a review round-trip or the user's attention, and it
@@ -432,12 +627,23 @@ class Agent:
         flagged = False
         edit_signature = f"{result.rel}:{action.start}-{action.end}:{action.payload or ''}"
         if self.self_review_enabled:
-            span_end = action.end or action.start or 1
+            span_start = action.start or 1
+            span_end = action.end or span_start
+            # The AFTER window must cover the lines that were actually
+            # written, not the old range - a 3-line EDIT that writes 40 lines
+            # otherwise shows the reviewer a fragment it calls "cut off".
+            payload_lines = len((action.payload or "").splitlines())
+            if action.kind == "EDIT":
+                new_start, new_end = span_start, span_start + max(payload_lines, 1) - 1
+            elif action.kind == "INSERT":
+                new_start, new_end = span_start + 1, span_start + max(payload_lines, 1)
+            else:
+                new_start, new_end = span_start, span_start
             ok, reason = self._run_self_review(
                 task_text,
                 result.rel,
-                review_snippet(result.old_text, action.start or 1, span_end),
-                review_snippet(result.new_text, action.start or 1, span_end),
+                review_snippet(result.old_text, span_start, span_end),
+                review_snippet(result.new_text, new_start, new_end),
             )
             flagged = not ok
             review_note = f" self-review: {reason.strip()[:300]}"
@@ -490,7 +696,18 @@ class Agent:
         self.session.save()
         self.edits_applied += 1
         self.console.print(f"[bold green]applied[/bold green] {action.kind} -> {result.rel}")
-        return f"Applied. {result.rel} now reflects the change.{review_note}", False
+        incomplete_note = ""
+        if result.rel.lower().endswith((".html", ".htm")):
+            unclosed = validate.html_unclosed_tags(result.new_text)
+            if unclosed:
+                tags = ", ".join(f"<{t}>" for t in unclosed)
+                line_count = len(result.new_text.splitlines())
+                self.console.print(f"[yellow]note:[/yellow] {result.rel} is unfinished - unclosed {tags}")
+                incomplete_note = (
+                    f" WARNING: {result.rel} is unfinished - {tags} never closed, so the page will "
+                    f"render blank. INSERT the rest after line {line_count} before saying it's done."
+                )
+        return f"Applied. {result.rel} now reflects the change.{review_note}{incomplete_note}", False
 
     # -- shell commands -----------------------------------------------------
 

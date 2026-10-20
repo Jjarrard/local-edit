@@ -137,3 +137,44 @@ def test_unparseable_verdict_defaults_to_allowing_the_edit(tmp_path):
     agent._handle_action(parse_action(GOOD_EDIT), None)
 
     assert "return a + b" in target.read_text()
+
+
+def test_lowercase_no_in_the_reason_does_not_flip_a_yes(tmp_path):
+    # Seen live: "YES\nThe file is valid HTML/CSS with no syntax errors" was
+    # read as NO because the last yes/no word anywhere in the reply won.
+    target = tmp_path / "calc.py"
+    target.write_text(ORIGINAL)
+    agent, _ = _agent(tmp_path, "YES  \nThe change is valid, with no syntax errors.")
+
+    result_text, _ = agent._handle_action(parse_action(GOOD_EDIT), None)
+
+    assert target.read_text() == "def add(a, b):\n    return a + b\n"
+    assert result_text.startswith("Applied.")
+
+
+def test_no_op_edit_is_neither_reviewed_nor_applied(tmp_path):
+    # Seen live: a model resent the unchanged file; the review objected, the
+    # identical retry slipped through the "apply unchanged retries" escape
+    # hatch, and the user was asked to approve "(no textual change)" forever.
+    target = tmp_path / "calc.py"
+    target.write_text(ORIGINAL)
+    agent, _ = _agent(tmp_path, "NO - nothing changed.")
+    same = "EDIT calc.py 2-2\n```\n    return a - b\n```\n"
+
+    for _ in range(2):
+        result_text, _ = agent._handle_action(parse_action(same), None)
+        assert result_text.startswith("No change")
+    assert agent.review_rejections == 0
+    assert agent.edits_applied == 0
+
+
+def test_unfinished_html_page_is_reported_back_to_the_model(tmp_path):
+    # Seen live: an INSERT ended mid-<style>, was applied, and the model
+    # declared success while the browser showed a blank page.
+    agent, _ = _agent(tmp_path, "YES - fine.")
+    partial = "INSERT index.html 0\n```html\n<html><head><style>\nbody { color: red; }\n```\n"
+
+    result_text, _ = agent._handle_action(parse_action(partial), None)
+
+    assert (tmp_path / "index.html").exists()
+    assert "unfinished" in result_text and "<style>" in result_text

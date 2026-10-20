@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import configparser
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -169,6 +170,27 @@ VALIDATORS: dict[str, Callable[[str], ValidationResult]] = {".py": _validate_pyt
 VALIDATORS.update({suffix: _validate_ini for suffix in (".ini", ".cfg")})
 VALIDATORS[".toml"] = _validate_toml
 VALIDATORS.update({suffix: _balanced_delimiters for suffix in BRACKET_LANGUAGES})
+
+
+_HTML_CONTAINERS = ("html", "head", "body", "style", "script")
+
+
+def html_unclosed_tags(text: str) -> list[str]:
+    """Container tags an HTML file opens but never closes.
+
+    Not a validator: a page legitimately written in several INSERTs is
+    unfinished between them, so this can't block an edit. It exists so the
+    model is told the page is incomplete instead of reporting success - an
+    unclosed <style> swallows the whole body and renders as a blank page.
+    """
+    lowered = text.lower()
+    unclosed = []
+    for tag in _HTML_CONTAINERS:
+        opens = len(re.findall(rf"<{tag}(?:\s[^>]*)?>", lowered))
+        closes = lowered.count(f"</{tag}>")
+        if opens > closes:
+            unclosed.append(tag)
+    return unclosed
 
 
 def register_validator(suffix: str, fn: Callable[[str], ValidationResult]) -> None:
