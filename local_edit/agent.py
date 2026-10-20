@@ -17,6 +17,7 @@ from rich.console import Console
 
 from . import files, shell, ui, validate
 from .client import ContextTooLargeError, JanClient, JanConnectionError
+from .progress import RECENT_UNTRIMMED, Progress, trim_old_message
 from .protocol import (
     FORMAT_REMINDER,
     Action,
@@ -36,7 +37,7 @@ from .review import (
 from .review import snippet as review_snippet
 from .state import STATUS_BLOCKED, STATUS_DONE, STATUS_IN_PROGRESS, Session
 
-MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_MESSAGES = 16
 DEFAULT_MAX_STEPS = 12
 
 # Local models run with small windows - and llama.cpp's --parallel N divides
@@ -84,6 +85,25 @@ def _drop_echo(pieces, prefix: str):
             matching = False
             yield buf
     # A stream that ended while still matching was only the echo - nothing new.
+
+
+def _step_label(action: Action) -> str:
+    """A few words naming what an action tried, for the progress note."""
+    kind, path = action.kind, action.path or ""
+    if kind in ("EDIT", "DELETE"):
+        return f"{kind} {path} {action.start}-{action.end or action.start}"
+    if kind == "INSERT":
+        return f"INSERT {path} after line {action.start}"
+    if kind == "READ":
+        return f"READ {path}" + (f" {action.start}-{action.end}" if action.start else "")
+    if kind == "RUN":
+        command = action.text or ""
+        return f"RUN {command[:50]}"
+    if kind == "GREP":
+        return f"GREP '{action.pattern}' in {path}"
+    if kind == "SAY":
+        return "chat message"
+    return f"{kind} {path}".strip()
 
 
 def _signature(text: str) -> str:
@@ -138,6 +158,8 @@ class Agent:
         # Code the model wrote in a chat message instead of a file command,
         # waiting for it to say where it goes (see _hold_code_from_chat).
         self._held_code: str | None = None
+        # What the model is working on and how it's going, shown every turn.
+        self.progress = Progress()
 
     @property
     def code_model(self) -> str:
@@ -161,6 +183,12 @@ class Agent:
         system_prompt = build_system_prompt(str(self.root), allow_run=self.allow_run)
         system = {"role": "system", "content": system_prompt}
         candidates = self.session.history[-MAX_HISTORY_MESSAGES:]
+        # Older turns lose their bulk - the progress note carries what they
+        # did - so the window holds more turns and the model reads less.
+        cut = len(candidates) - RECENT_UNTRIMMED
+        candidates = [trim_old_message(m) if i < cut else m for i, m in enumerate(candidates)]
+        note = self.progress.render()
+        reserve_chars += len(note) + 2 if note else 0
         kept: list[dict] = []
         budget = self._history_budget_chars(system_prompt, reserve_chars)
         for msg in reversed(candidates):
@@ -194,6 +222,11 @@ class Agent:
         # any such orphan rather than sending a malformed request.
         while kept and kept[0]["role"] != "user":
             kept.pop(0)
+        # The note goes at the end of the newest message, not in the system
+        # prompt: llama.cpp reuses its cache for an unchanged prompt prefix,
+        # and a note that changes every turn would invalidate all of it.
+        if note and kept and kept[-1]["role"] == "user":
+            kept[-1] = {**kept[-1], "content": kept[-1]["content"] + "\n\n" + note}
         return [system] + kept
 
     # A small/degenerate model streaming the same line over and over is a
@@ -347,6 +380,41 @@ class Agent:
             text += more
         return text.strip()
 
+    def _check_done(self) -> str | None:
+        """Ask, once per request, whether DONE is premature.
+
+        Small models stop after the first half of "do X and Y". A closed
+        question over the progress note catches that cheaply. Returns what's
+        missing, or None to accept the DONE. Once per request, so a reviewer
+        that keeps saying NO can't trap the model.
+        """
+        progress = self.progress
+        if not progress.goal or progress.done_checked or not self.self_review_enabled:
+            return None
+        progress.done_checked = True
+        prompt = (
+            f"Request: {progress.goal}\n\n"
+            "What was done, in order:\n" + ("\n".join(progress.steps) or "(nothing)") + "\n\n"
+            "Has EVERY part of the request been done? Answer YES or NO. "
+            "If NO, then say in a few words which part is missing."
+        )
+        messages = [
+            {"role": "system", "content": "You check whether a task is finished. You answer YES or NO."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            reply = self._stream_and_print(
+                messages, label="check", max_tokens=REVIEW_MAX_TOKENS, model=self.fast_model,
+                waiting_message="checking the request is finished",
+            )
+        except Exception:  # noqa: BLE001 - advisory, like self-review
+            return None
+        finished, reason = parse_review_verdict(reply)
+        if finished:
+            return None
+        detail = re.sub(r"^\W*NO\W*", "", reason.strip(), flags=re.IGNORECASE).strip()
+        return detail[:200] or "part of the request is still missing"
+
     def _run_self_review(self, task_text: str, rel: str, before: str, after: str) -> tuple[bool, str]:
         try:
             reply = self._stream_and_print(
@@ -392,6 +460,7 @@ class Agent:
             action = self._attach_held_code(raw)
             if action is None:
                 msg = FORMAT_REMINDER.format(error=str(exc))
+                self.progress.record("unparseable reply", f"ERROR: {exc}")
                 self.session.add_message("user", msg)
                 self.console.print(f"[red]parse error:[/red] {exc}")
                 return False, "parse_error", raw
@@ -400,6 +469,7 @@ class Agent:
         # neither the preamble nor a SAY body gets echoed a second time.
 
         result_text, finished = self._handle_action(action, active_todo)
+        self.progress.record(_step_label(action), result_text)
         if result_text is not None:
             if result_text.startswith("ERROR:"):
                 # The model sees every error; the user should too, or a run of
@@ -423,6 +493,13 @@ class Agent:
             return None, True
 
         if kind == "DONE":
+            missing = self._check_done()
+            if missing:
+                return (
+                    f"Not finished yet - {missing}. Continue with ONE command "
+                    f"(READ the file first if you need to see it).",
+                    False,
+                )
             return None, True
 
         if kind == "LIST":
@@ -695,6 +772,7 @@ class Agent:
         self.session.backup_and_record(result.rel, result.old_text, result.new_text, result.is_new_file)
         self.session.save()
         self.edits_applied += 1
+        self.progress.note_file(result.rel, len(result.new_text.splitlines()))
         self.console.print(f"[bold green]applied[/bold green] {action.kind} -> {result.rel}")
         incomplete_note = ""
         if result.rel.lower().endswith((".html", ".htm")):
@@ -774,6 +852,7 @@ class Agent:
         prev_len = len(self.session.history)
         prev_last_content = self.session.history[-1]["content"] if self.session.history else None
         self.session.add_message("user", user_text)
+        self.progress.start(user_text)
 
         # A single chat message can need several tool calls before there's
         # anything to say back (e.g. "recreate Pong" starts with LIST/READ).
@@ -886,6 +965,7 @@ class Agent:
             f"When it's fully done, reply with TODO DONE {todo.id}."
         )
         self.session.add_message("user", prompt)
+        self.progress.start(f"TODO #{todo.id}: {todo.text}")
         consecutive_stalls = 0
         last_signature: str | None = None
         for _ in range(self.max_steps):
