@@ -109,3 +109,17 @@ def test_unknown_extension_always_passes():
 def test_html_is_not_bracket_checked():
     # HTML legitimately contains unbalanced braces in inline CSS/JS snippets
     assert validate.validate("index.html", "<style>body { color: red }</style>").ok
+
+
+def test_markup_inside_a_style_block_is_rejected():
+    # Seen live: EDIT index.html 15-100 replaced CSS rules with the page's
+    # header/main/footer, all inside <style>.
+    from local_edit.validate import validate
+
+    broken = "<html><head><style>\nbody { margin: 0; }\n        <footer class=\"f\">\n</style></head><body></body></html>"
+    result = validate("index.html", broken)
+    assert not result.ok and "line 3" in result.message
+
+    fine = "<html><head><style>\nbody { margin: 0; }\n</style></head><body><footer>x</footer>\n" \
+           "<script>el.innerHTML = `\n<div class=\"card\">`;</script></body></html>"
+    assert validate("index.html", fine).ok

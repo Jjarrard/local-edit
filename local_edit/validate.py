@@ -193,6 +193,32 @@ def html_unclosed_tags(text: str) -> list[str]:
     return unclosed
 
 
+_STYLE_BLOCK_RE = re.compile(r"<style\b[^>]*>(.*?)</style>", re.DOTALL | re.IGNORECASE)
+_TAG_LINE_RE = re.compile(r"^\s*</?[a-zA-Z][\w-]*[\s>/]", re.MULTILINE)
+
+
+def _validate_html(text: str) -> ValidationResult:
+    """Catch markup pasted into a <style> block.
+
+    A line-range EDIT that misses by a few dozen lines lands page markup in
+    the CSS - the browser then ignores it as bad CSS and the page loses its
+    content. CSS never has a line starting with a tag, so that's a definite
+    mistake. (<script> isn't checked: JS template strings hold markup.)
+    """
+    for block in _STYLE_BLOCK_RE.finditer(text):
+        tag = _TAG_LINE_RE.search(block.group(1))
+        if tag:
+            line = text.count("\n", 0, block.start(1) + tag.start()) + 1
+            return ValidationResult.bad(
+                f"HTML markup inside the <style> block at line {line} ({tag.group(0).strip()}...) - "
+                "page content belongs after </style> and </head>, inside <body>"
+            )
+    return ValidationResult.good()
+
+
+VALIDATORS.update({suffix: _validate_html for suffix in (".html", ".htm")})
+
+
 def register_validator(suffix: str, fn: Callable[[str], ValidationResult]) -> None:
     """Register (or override) the validator used for a given file extension.
 
