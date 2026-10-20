@@ -80,7 +80,10 @@ def list_tree(root: Path, rel: str = ".", max_depth: int = 3) -> str:
             return
         for entry in entries:
             if len(lines) >= MAX_LIST_ENTRIES:
-                lines.append("... (truncated)")
+                # The walk is recursive: only the first level to hit the cap
+                # adds the marker, not every ancestor on the way back up.
+                if lines[-1] != "... (truncated)":
+                    lines.append("... (truncated)")
                 return
             if entry.name in IGNORE_DIRS:
                 continue
