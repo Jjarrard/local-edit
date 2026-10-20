@@ -49,3 +49,12 @@ def test_self_review_client_error_defaults_to_allow():
     ok, reason = self_review(BrokenClient(), "task", "a.py", "before", "after")
     assert ok is True
     assert "unavailable" in reason
+
+
+def test_verdict_line_wins_over_prose_in_the_reason():
+    from local_edit.review import parse_review_verdict
+
+    assert parse_review_verdict("YES\nNo syntax errors and no regressions.")[0] is True
+    assert parse_review_verdict("**NO** - yes, it parses, but it nests the function.")[0] is False
+    assert parse_review_verdict("<think>maybe NO... actually fine</think>\nYES, correct.")[0] is True
+    assert parse_review_verdict("The answer is NO, it breaks the loop.")[0] is False

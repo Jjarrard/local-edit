@@ -77,17 +77,35 @@ def build_review_messages(task_text: str, rel: str, before: str, after: str) -> 
     ]
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL | re.IGNORECASE)
+_LEADING_VERDICT_RE = re.compile(r"^[\s*_`>\-]*(YES|NO)\b", re.MULTILINE)
+_LEADING_VERDICT_ANYCASE_RE = re.compile(r"^[\s*_`>\-]*(YES|NO)\b", re.IGNORECASE | re.MULTILINE)
+
+
 def parse_review_verdict(reply: str) -> tuple[bool, str]:
     reply = reply.strip()
     # Reasoning models front-load a <think> block, so the verdict can land
     # anywhere in the reply (and no single stop sequence is safe to use,
-    # since "\n\n" reliably shows up inside their reasoning). Take the last
-    # standalone YES/NO in the text as the conclusion.
-    matches = re.findall(r"\bYES\b|\bNO\b", reply, re.IGNORECASE)
+    # since "\n\n" reliably shows up inside their reasoning). Drop the
+    # reasoning, then take the last line that *starts* with YES/NO - the
+    # reason sentence after it is prose, and words in it like "no syntax
+    # errors" must not be read as a verdict.
+    answer = _THINK_BLOCK_RE.sub("", reply).strip() or reply
+    leading = _LEADING_VERDICT_RE.findall(answer)
+    if leading:
+        return leading[-1] != "NO", reply
+    # A lowercase "Yes," / "no -" opening line still counts, but only the
+    # first one: a later "No syntax errors..." line is the reason, not a
+    # second verdict.
+    leading = _LEADING_VERDICT_ANYCASE_RE.findall(answer)
+    if leading:
+        return leading[0].upper() != "NO", reply
+    # No line opens with a verdict - fall back to an uppercase YES/NO
+    # anywhere, which a lowercase "no" in prose can't trigger.
+    matches = re.findall(r"\bYES\b|\bNO\b", answer)
     if not matches:
         return True, reply or "(no verdict given)"
-    ok = matches[-1].upper() != "NO"
-    return ok, reply
+    return matches[-1] != "NO", reply
 
 
 def self_review(client: JanClient, task_text: str, rel: str, before: str, after: str) -> tuple[bool, str]:
