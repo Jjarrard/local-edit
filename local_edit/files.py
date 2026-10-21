@@ -98,6 +98,30 @@ def list_tree(root: Path, rel: str = ".", max_depth: int = 3) -> str:
     return "\n".join(lines) if lines else "(empty)"
 
 
+def project_files(root: Path, limit: int = 8) -> list[tuple[str, int]]:
+    """Up to `limit` text files with their line counts, least recently
+    changed first (so the newest are last, next to the progress steps)."""
+    found: list[tuple[float, str, int]] = []
+    base = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS and not d.startswith(".")]
+        for name in filenames:
+            if name.startswith("."):
+                continue
+            path = Path(dirpath) / name
+            try:
+                if path.stat().st_size > 2_000_000:
+                    continue
+                count = len(path.read_text().splitlines())
+                found.append((path.stat().st_mtime, str(path.relative_to(base)), count))
+            except (OSError, UnicodeDecodeError):
+                continue  # binary or unreadable - not something to edit
+            if len(found) > 200:
+                break
+    found.sort()
+    return [(rel, n) for _, rel, n in found[-limit:]]
+
+
 def grep(root: Path, pattern: str, rel: str = ".", glob: str = "*") -> str:
     base = resolve(root, rel)
     pattern_lower = pattern.lower()

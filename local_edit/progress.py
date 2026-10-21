@@ -19,7 +19,7 @@ import re
 from collections import OrderedDict, deque
 
 MAX_STEPS = 5
-MAX_FILES = 5
+MAX_FILES = 8
 MAX_LINE = 110
 MAX_GOAL = 240
 MAX_NOTE_CHARS = 900
@@ -46,8 +46,8 @@ class Progress:
         self.steps: deque[str] = deque(maxlen=MAX_STEPS)
         self.files: OrderedDict[str, int] = OrderedDict()
         self.last_problem: str | None = None
-        # Whether a DONE for this request has already been double-checked.
-        self.done_checked = False
+        # How many DONEs for this request have been double-checked.
+        self.done_checks = 0
 
     def start(self, goal: str) -> None:
         """A new request. The previous one is kept (one level only), because
@@ -60,7 +60,12 @@ class Progress:
         self.goal = goal
         self.steps.clear()
         self.last_problem = None
-        self.done_checked = False
+        self.done_checks = 0
+
+    def set_project_files(self, files: list[tuple[str, int]]) -> None:
+        """What's in the project, so a request that doesn't name a file
+        ("add a footer") goes to index.html instead of a new footer.html."""
+        self.files = OrderedDict(files[-MAX_FILES:])
 
     def note_file(self, rel: str, line_count: int) -> None:
         self.files.pop(rel, None)
@@ -69,6 +74,12 @@ class Progress:
             self.files.popitem(last=False)
 
     def record(self, label: str, result_text: str | None) -> None:
+        # A FIX says what it actually did ("rewrote 'header {'"); that, not the
+        # request it was given, is what the step list must show - otherwise
+        # "FIX green header and add footer -> ok" reads as both done.
+        did = re.match(r"Applied \(((?:rewrote|added) .*)\)\.", (result_text or "").strip())
+        if did:
+            label = re.sub(r":.*$", "", label) + ": " + did.group(1)
         """One step: what was tried (`label`) and how the harness answered."""
         first = (result_text or "").strip().splitlines()[0] if (result_text or "").strip() else ""
         if first.startswith(("ERROR", "Your ", "User rejected", "User declined", "That ")):
@@ -94,7 +105,9 @@ class Progress:
         if self.earlier_goal:
             lines.append(f"Before that: {self.earlier_goal}")
         if self.files:
-            lines.append("Files touched: " + ", ".join(f"{rel} ({n} lines)" for rel, n in self.files.items()))
+            lines.append("Project files: " + ", ".join(f"{rel} ({n} lines)" for rel, n in self.files.items()))
+        else:
+            lines.append("Project files: none yet")
         if self.steps:
             lines.append("Recent steps, oldest first:")
             lines.extend(f"  {s}" for s in self.steps)

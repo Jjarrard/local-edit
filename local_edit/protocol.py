@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-COMMANDS = ("SAY", "LIST", "READ", "GREP", "RUN", "TODO", "EDIT", "INSERT", "DELETE", "DONE")
+COMMANDS = ("SAY", "LIST", "READ", "GREP", "RUN", "TODO", "FIX", "EDIT", "INSERT", "DELETE", "DONE")
 
 # Models dress their commands up. DeepSeek-R1 writes "COMMAND: INSERT x 0";
 # others use markdown bullets, numbered steps, block quotes, bold, or inline
@@ -166,7 +166,7 @@ def find_bare_shell_command(text: str) -> str | None:
     return None
 
 
-_FILE_COMMANDS = ("EDIT", "INSERT", "DELETE")
+_FILE_COMMANDS = ("FIX", "EDIT", "INSERT", "DELETE")
 
 
 def _later_file_command(text: str, from_pos: int) -> Action | None:
@@ -284,6 +284,16 @@ def parse_action(raw_text: str) -> Action:
             return Action(kind="TODO_DONE", preamble=preamble, todo_id=int(arg), raw=raw_text)
         return Action(kind="TODO_LIST", preamble=preamble, raw=raw_text)
 
+    if keyword == "FIX":
+        # FIX <path> <what to change, in words> - the harness finds the lines.
+        fm = re.match(r"^(\S+?)[:,]?(?:\s+(.*))?$", rest_of_line)
+        if not fm:
+            raise ParseError("FIX needs a path and what to change, e.g. FIX index.html make the header green")
+        return Action(
+            kind="FIX", preamble=preamble, path=fm.group(1),
+            text=(fm.group(2) or "").strip(" :-") or None, raw=raw_text,
+        )
+
     if keyword == "EDIT":
         parts = rest_of_line.split()
         if len(parts) < 2:
@@ -362,6 +372,7 @@ FORMAT_REMINDER = (
     "  TODO ADD <text>               - add a todo\n"
     "  TODO DONE <id>                - complete a todo\n"
     "  TODO LIST                     - show todos\n"
+    "  FIX <path> <what to change>   - change an existing file; say what in words\n"
     "  EDIT <path> <start>-<end>     - replace those lines, followed by a ``` block\n"
     "  INSERT <path> <line>          - insert after that line, followed by a ``` block\n"
     "  DELETE <path> <start>-<end>   - delete those lines\n"
@@ -383,36 +394,28 @@ COMMANDS (your reply must start with one of these):
   READ <path> [start-end]     show numbered file lines
   GREP <text> [in <path>]     search
 {run_doc}  TODO ADD <text> | TODO DONE <id> | TODO LIST
-  EDIT <path> <start>-<end>   replace those lines, then a ``` block
+  FIX <path> <what to change> change an existing file - say WHAT in words, no code.
+                              local-edit finds the right lines and asks you to rewrite them
   INSERT <path> <line>        insert after that line, then a ``` block
+  EDIT <path> <start>-<end>   replace exactly those lines, then a ``` block
   DELETE <path> <start>-<end> delete those lines
   DONE                        task complete
 
 RULES:
-- Code goes only in an EDIT/INSERT ``` block. Code in a SAY is thrown away.
 - New file: INSERT <path> 0 with the full content. Do not READ it first.
 - New folder: just INSERT a file inside it (INSERT assets/style.css 0) - missing parent
   folders are created automatically. For an empty folder, RUN mkdir -p assets.
-- Existing file: READ it first, then EDIT only the wrong lines.
-- Use relative paths (src/app.py). Line numbers are 1-indexed and inclusive.
+- If the request doesn't name a file, it is about a file that already exists (see
+  "Project files") - change that file, don't create a new one.
+- Existing file: use FIX, one change at a time. No need to READ it first. Examples:
+    FIX index.html make the header background green
+    FIX index.html add a footer with contact details
+    FIX index.html remove the booking form
+    FIX app.py handle an empty list in average()
+  Two changes = two FIX commands, one after the other.
+- Code goes only in an INSERT/EDIT ``` block. Code in a SAY is thrown away.
+- Use relative paths (src/app.py).
 - On ERROR, fix that specific thing. Never resend an identical failing command.
-
-THE #1 MISTAKE: the ``` block replaces the named lines exactly - it is not the new
-version of the whole function. Given:
-    1: def add(a, b):
-    2:     return a - b
-Right - replaces only line 2:
-EDIT calc.py 2-2
-```
-    return a + b
-```
-Wrong - resends the def line, nesting the function inside itself:
-EDIT calc.py 2-2
-```
-def add(a, b):
-    return a + b
-```
-To replace the whole function, name every line it covers: EDIT calc.py 1-2
 """
 
 

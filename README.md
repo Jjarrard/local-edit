@@ -81,6 +81,14 @@ model **cannot** do:
   yes. Commands run with `cwd` pinned to the project, `stdin` closed so they
   can't hang, a wall-clock timeout, and truncated output. See
   [`shell.py`](local_edit/shell.py).
+- **Can't break a page's structure.** HTML edits must keep every `<div>`,
+  `<section>`, `<footer>`... balanced, can't put markup inside `<style>` or
+  after `</html>`, and a page left with an unclosed `<style>` is reported as
+  unfinished instead of done.
+- **Can't lose track of the task.** Every turn ends with a short progress note
+  built from what actually happened - the request, project files, the last
+  few steps - capped in size, with old file dumps trimmed out of history.
+  A `DONE` is double-checked against the request before it's accepted.
 - **Can't loop forever.** Repeated identical replies, off-task `TODO ADD`
   spam, and mid-stream repetition are all cut off; the todo queue is capped;
   a single `/work` call processes a bounded number of todos.
@@ -101,12 +109,34 @@ model **cannot** do:
 
 The model speaks a line-oriented grammar, one action per reply:
 
-`SAY` · `LIST` · `READ` · `GREP` · `RUN` · `TODO ADD/DONE/LIST` · `EDIT` ·
-`INSERT` · `DELETE` · `DONE`
+`SAY` · `LIST` · `READ` · `GREP` · `RUN` · `TODO ADD/DONE/LIST` · `FIX` ·
+`EDIT` · `INSERT` · `DELETE` · `DONE`
 
-Edits are always line-range based (`EDIT src/app.py 12-14` + a fenced block)
-against a file the model was just shown with line numbers — never whole-file
-rewrites.
+New files are written with `INSERT <path> 0`. Existing files are changed with
+`FIX <path> <what to change>` - in words, with no line numbers and no code:
+
+```
+FIX index.html make the header background green
+```
+
+The model never names lines or sees the whole file. Code does the finding and
+splicing; the model answers small questions and rewrites one short block
+(see [`focus.py`](local_edit/focus.py)):
+
+1. the file is split into blocks - CSS rules, HTML elements, functions - by
+   indentation and closing lines, so no parser per language is needed
+2. blocks are ranked against the request by shared words (`btn` counts as
+   "button", and a `.book-btn` rule knows it's used by "Book Now" buttons)
+3. the model picks one from a numbered list - or "none of the above" when the
+   request adds something
+4. it rewrites just that block, or writes just the new part, which code puts
+   after the block it chose
+5. "make X and add Y" is split into two FIXes; "add another stall" goes after
+   the last stall without asking
+
+Each step is a standalone prompt of a few hundred tokens, however big the
+file is. `EDIT`/`INSERT <line>`/`DELETE` still work with line numbers, but
+only once the model has READ the file.
 
 ## Slash commands
 

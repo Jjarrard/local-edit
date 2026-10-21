@@ -15,7 +15,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from . import files, shell, ui, validate
+from . import files, focus, shell, ui, validate
 from .client import ContextTooLargeError, JanClient, JanConnectionError
 from .progress import RECENT_UNTRIMMED, Progress, trim_old_message
 from .protocol import (
@@ -52,7 +52,8 @@ MIN_HISTORY_CHARS = 800  # always leave room for the current request
 
 _FENCED_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 
-MAX_CONTINUATIONS = 4  # one reply can grow to (1 + this) x max_tokens
+MAX_CONTINUATIONS = 4
+MAX_DONE_CHECKS = 2  # per request  # one reply can grow to (1 + this) x max_tokens
 
 
 def _drop_echo(pieces, prefix: str):
@@ -103,6 +104,8 @@ def _step_label(action: Action) -> str:
         return f"GREP '{action.pattern}' in {path}"
     if kind == "SAY":
         return "chat message"
+    if kind == "FIX":
+        return f"FIX {path}: {(action.text or '')[:60]}"
     return f"{kind} {path}".strip()
 
 
@@ -385,13 +388,13 @@ class Agent:
 
         Small models stop after the first half of "do X and Y". A closed
         question over the progress note catches that cheaply. Returns what's
-        missing, or None to accept the DONE. Once per request, so a reviewer
-        that keeps saying NO can't trap the model.
+        missing, or None to accept the DONE. Capped per request, so a
+        checker that keeps saying NO can't trap the model.
         """
         progress = self.progress
-        if not progress.goal or progress.done_checked or not self.self_review_enabled:
+        if not progress.goal or progress.done_checks >= MAX_DONE_CHECKS or not self.self_review_enabled:
             return None
-        progress.done_checked = True
+        progress.done_checks += 1
         prompt = (
             f"Request: {progress.goal}\n\n"
             "What was done, in order:\n" + ("\n".join(progress.steps) or "(nothing)") + "\n\n"
@@ -549,6 +552,9 @@ class Agent:
             self.console.print(out)
             return out, False
 
+        if kind == "FIX":
+            return self._handle_fix(action, active_todo)
+
         if kind in ("EDIT", "INSERT", "DELETE"):
             return self._handle_write(action, active_todo)
 
@@ -642,8 +648,207 @@ class Agent:
         action.kind, action.start, action.end = "EDIT", 1, line_count
         return action
 
-    def _handle_write(self, action: Action, active_todo) -> tuple[str | None, bool]:
+    # -- FIX: harness finds the code, model rewrites it -----------------------------
+
+    def _ask(self, prompt: str, label: str, max_tokens: int | None = None, model: str | None = None) -> str:
+        """One standalone question - no history, no system prompt beyond a line.
+
+        Each FIX step is a self-contained prompt of a few hundred tokens, so
+        it never competes with the conversation for the window. Code replies
+        that hit the length limit mid-block are continued like main turns.
+        """
+        messages = [
+            {"role": "system", "content": "You are a careful assistant. Answer exactly in the format asked."},
+            {"role": "user", "content": prompt},
+        ]
+        text = self._stream_and_print(
+            messages, label=label, max_tokens=max_tokens, model=model, waiting_message=label, strip=False
+        )
+        for _ in range(MAX_CONTINUATIONS):
+            if getattr(self.client, "last_finish_reason", None) != "length" or text.count("```") % 2 == 0:
+                break
+            if self._last_stream_aborted:
+                break
+            more = self._stream_and_print(
+                messages + [{"role": "assistant", "content": text}], label=None,
+                waiting_message="continuing", echo_prefix=text, strip=False,
+            )
+            if not more.strip():
+                break
+            text += more
+        return text.strip()
+
+    def _ask_for_code(self, prompt: str, block) -> str | None:
+        """Ask for a block of code; one retry if it comes back as the whole file."""
+        for attempt in range(2):
+            code = focus.extract_code(self._ask(prompt, label="write"))
+            if not code or not focus.looks_like_whole_file(code, block):
+                return code
+            self.console.print("[yellow](that was the whole file - asking for just the part again)[/yellow]")
+            prompt += "\n\nNOT the whole file. Only the lines asked for."
+        return None
+
+    def _handle_fix(self, action: Action, active_todo) -> tuple[str | None, bool]:
+        try:
+            target = files.resolve(self.root, action.path)
+        except files.PathError as exc:
+            return f"ERROR: {exc}", False
+        if not target.is_file():
+            return f"ERROR: no such file: {action.path} - to create it, INSERT {action.path} 0", False
+        request = action.text or self.progress.goal or ""
+        if not request:
+            return "ERROR: FIX needs to say what to change, e.g. FIX index.html make the header green", False
+        parts = focus.split_request(request)
+        if len(parts) > 1:
+            self.console.print(f"[dim](doing this as {len(parts)} separate changes)[/dim]")
+        results: list[str] = []
+        for n, part in enumerate(parts, 1):
+            result_text, finished = self._fix_one(action.path, target, part, active_todo)
+            results.append(result_text or "")
+            if not (result_text or "").startswith("Applied"):
+                if n > 1:
+                    # Report what landed, so the model doesn't redo it.
+                    result_text = (
+                        f"{result_text}\nAlready done by this FIX: " + " ".join(results[:-1])
+                    )
+                return result_text, finished
+        return " ".join(results), False
+
+    def _fix_one(self, rel: str, target: Path, request: str, active_todo) -> tuple[str | None, bool]:
+        blocks = focus.split_blocks(target.read_text(errors="replace"))
+        if not blocks:
+            return f"ERROR: {rel} is empty - INSERT {rel} 0 with its content instead", False
+
+        # 1. which block? (closed question; fall back to the best keyword match)
+        # The user's own words count too: the model's FIX text often drops
+        # the name that matters ("handle empty lists" for average()).
+        # Only as a fallback, though - for one part of a split request the
+        # rest of the sentence ("...header green...") is noise.
+        ranking_text = request
+        choices = focus.candidates(blocks, request)
+        if not choices and self.progress.goal:
+            ranking_text = f"{request} {self.progress.goal}"
+            choices = focus.candidates(blocks, ranking_text)
+        choices = choices or focus.outline(blocks)
+        choice: int | str | None = "NEW"
+        if choices and not focus.adds_something_absent(blocks, request):
+            reply = self._ask(focus.choose_prompt(request, rel, choices), label="find", max_tokens=16,
+                              model=self.fast_model)
+            choice = focus.parse_choice(reply, len(choices))
+            if choice == "NEW" and not focus.is_adding(request):
+                choice = None  # "none of the above" wasn't offered
+            if choice is None:
+                best = focus.candidates(blocks, ranking_text, limit=1)
+                choice = 1 + choices.index(best[0]) if best and best[0] in choices else 1
+
+        if isinstance(choice, int):
+            # 2a. rewrite just that block
+            block = choices[choice - 1]
+            self.console.print(f"[dim](rewriting lines {block.start}-{block.end}: {block.head[:60]})[/dim]")
+            code = self._ask_for_code(focus.rewrite_prompt(request, rel, block), block)
+            if code is None:
+                return f"ERROR: FIX {rel}: no usable rewrite of lines {block.start}-{block.end} came back", False
+            if code == "":
+                # An empty rewrite is the model's way of saying "remove it".
+                edit = Action(kind="DELETE", path=rel, start=block.start, end=block.end)
+                where = f"removed lines {block.start}-{block.end}, {block.head[:40]}"
+            else:
+                edit = Action(kind="EDIT", path=rel, start=block.start, end=block.end,
+                              payload=focus.match_indent(code, block.indent))
+                where = f"rewrote lines {block.start}-{block.end}, {block.head[:40]}"
+        else:
+            # 2b. new code: where does it go, then write only that
+            after = focus.obvious_place(blocks, request)
+            if after is None:
+                spots = focus.places(blocks)
+                reply = self._ask(focus.place_prompt(request, rel, spots), label="place", max_tokens=16,
+                                  model=self.fast_model)
+                spot = focus.parse_choice(reply, len(spots))
+                after = spots[spot - 1] if isinstance(spot, int) else spots[-1]
+            self.console.print(f"[dim](adding new code after lines {after.start}-{after.end}: {after.head[:60]})[/dim]")
+            code = self._ask_for_code(focus.new_code_prompt(request, rel, after), None)
+            code = focus.trim_stray_closers(code) if code else code
+            if not code:
+                return f"ERROR: FIX {rel}: no usable new code came back", False
+            edit = Action(kind="INSERT", path=rel, start=after.end,
+                          payload=focus.match_indent(code, after.indent))
+            where = f"added {len(code.splitlines())} lines after line {after.end}, {after.head[:40]}"
+
+        result_text, finished = self._handle_write(edit, active_todo, task_text=request, from_fix=True)
+        if result_text and result_text.startswith("Applied."):
+            result_text = f"Applied ({where})." + result_text[len("Applied."):]
+        return result_text, finished
+
+    def _unrequested_new_file(self, action: Action) -> str | None:
+        """Push back, once, on a new file nobody asked for.
+
+        Asked to "add a footer" to a one-page site, a small model writes
+        footer.html - or src/components/Navbar.jsx - files the page never
+        loads. If the request doesn't name the file and the project already
+        has files, that's almost always the wrong target. Sending the same
+        INSERT again goes through, so a genuinely new file is never blocked.
+        """
+        if action.kind != "INSERT" or action.start != 0:
+            return None
+        try:
+            target = files.resolve(self.root, action.path)
+        except files.PathError:
+            return None
+        if target.exists():
+            return None
+        request = (self.progress.goal or "") + " " + (self.progress.earlier_goal or "")
+        if Path(action.path).name.lower() in request.lower():
+            return None
+        existing = list(self.progress.files)
+        if not existing:
+            return None
+        same_type = [rel for rel in existing if Path(rel).suffix == target.suffix] or existing[-1:]
+        signature = f"new-file:{action.path}"
+        if signature in self._flagged_edits:
+            return None
+        self._flagged_edits.add(signature)
+        self.console.print(f"[yellow]{action.path} would be a new file - checking that's intended[/yellow]")
+        return (
+            f"ERROR: the request didn't ask for a new file, and {action.path} would not be part of "
+            f"{same_type[0]}. To change {same_type[0]}, use: FIX {same_type[0]} <what to change>. "
+            f"If a separate new file really is needed, send the same INSERT again."
+        )
+
+    def _blind_line_edit(self, action: Action) -> str | None:
+        """Push back, once per file and request, on line numbers never seen.
+
+        `INSERT index.html 100` from a model that hasn't READ the file this
+        request is a guess - it landed a stall card inside the CSS. FIX
+        needs no line numbers, so point there instead.
+        """
+        if not self.progress.goal:
+            return None  # no request in progress (a /work todo sets one too)
+        if action.kind not in ("EDIT", "INSERT", "DELETE") or (action.kind == "INSERT" and action.start == 0):
+            return None
+        try:
+            if not files.resolve(self.root, action.path).is_file():
+                return None
+        except files.PathError:
+            return None
+        if any(step.startswith(f"READ {action.path}") for step in self.progress.steps):
+            return None
+        signature = f"blind:{self.progress.goal}:{action.path}"
+        if signature in self._flagged_edits:
+            return None
+        self._flagged_edits.add(signature)
+        self.console.print(f"[yellow]{action.kind} on lines of {action.path} it hasn't read - suggesting FIX[/yellow]")
+        return (
+            f"ERROR: you haven't READ {action.path} for this request, so those line numbers are a guess. "
+            f"Use FIX {action.path} <what to change> instead - it finds the right lines for you."
+        )
+
+    def _handle_write(
+        self, action: Action, active_todo, task_text: str | None = None, from_fix: bool = False
+    ) -> tuple[str | None, bool]:
         action = self._as_whole_file_rewrite(action)
+        objection = self._unrequested_new_file(action) or (None if from_fix else self._blind_line_edit(action))
+        if objection:
+            return objection, False
         try:
             if action.kind == "EDIT":
                 if action.payload_truncated:
@@ -696,14 +901,29 @@ class Agent:
                 False,
             )
 
+        if result.rel.lower().endswith((".html", ".htm")):
+            unbalanced = validate.html_balance_change(result.old_text, result.new_text)
+            if unbalanced:
+                self.validation_failures += 1
+                self.console.print(f"[bold red]rejected (would break the page):[/bold red] {unbalanced}")
+                return (
+                    f"ERROR: that {action.kind} would break {result.rel} - {unbalanced}. "
+                    f"The file was NOT changed.",
+                    False,
+                )
+
         title = f"{action.kind} {result.rel}"
         render_diff(self.console, result.diff, title)
 
-        task_text = active_todo.text if active_todo else "(ad hoc chat edit)"
+        if task_text is None:
+            task_text = active_todo.text if active_todo else (self.progress.goal or "(ad hoc chat edit)")
         review_note = ""
         flagged = False
         edit_signature = f"{result.rel}:{action.start}-{action.end}:{action.payload or ''}"
-        if self.self_review_enabled:
+        # FIX edits skip the model review: FIX's own steps chose the block,
+        # and validation above checks the structure - which a small reviewer
+        # misjudges (it rejected a correctly placed footer as "bad nesting").
+        if self.self_review_enabled and not from_fix:
             span_start = action.start or 1
             span_end = action.end or span_start
             # The AFTER window must cover the lines that were actually
@@ -853,6 +1073,7 @@ class Agent:
         prev_last_content = self.session.history[-1]["content"] if self.session.history else None
         self.session.add_message("user", user_text)
         self.progress.start(user_text)
+        self.progress.set_project_files(files.project_files(self.root))
 
         # A single chat message can need several tool calls before there's
         # anything to say back (e.g. "recreate Pong" starts with LIST/READ).
@@ -966,6 +1187,7 @@ class Agent:
         )
         self.session.add_message("user", prompt)
         self.progress.start(f"TODO #{todo.id}: {todo.text}")
+        self.progress.set_project_files(files.project_files(self.root))
         consecutive_stalls = 0
         last_signature: str | None = None
         for _ in range(self.max_steps):

@@ -1,0 +1,442 @@
+"""FIX: the harness finds the code, the model only rewrites it.
+
+A 4B model can't be trusted to name lines (EDIT 15-100 for a 3-line rule)
+or to quote them (it writes the file it wants instead). What it can do is
+answer a small closed question and rewrite a short block it is shown. So a
+FIX is broken into steps that each fit that:
+
+  1. code splits the file into blocks - CSS rules, HTML elements,
+     functions - by indentation and closing lines, no parser needed
+  2. code ranks the blocks against the request by shared words
+  3. model: "which of these numbered blocks needs to change? or NEW"
+  4. model: "rewrite this block so that ..." - or, for NEW, "after which
+     block does it go?" then "write only the new part"
+  5. code splices the result in at boundaries it already knows
+
+The model never sees the whole file and never writes a line number, and
+every prompt is a few hundred tokens however big the file is - the same
+shape as local-search, where code does the searching and cutting and the
+model answers small questions.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+MAX_REWRITE_LINES = 60   # never ask the model to rewrite more than this at once
+MAX_CHOICES = 8
+MAX_PLACES = 16
+
+_CLOSER_RE = re.compile(r"^\s*(\}|\)|\]|</|end\b|fi\b|done\b|esac\b)")
+_WORD_RE = re.compile(r"[a-z][a-z0-9]+")
+_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "make", "add", "change", "into", "from", "some", "to",
+    "can", "you", "please", "should", "would", "want", "need", "file", "page", "website", "site",
+    "html", "css", "code", "just", "also", "new", "all", "its", "use", "more", "less", "bit",
+}
+
+
+@dataclass
+class Block:
+    start: int  # 1-indexed, inclusive
+    end: int
+    depth: int
+    lines: list[str]
+    used_by: str = ""  # for a CSS class rule: a line of markup that uses it
+
+    @property
+    def size(self) -> int:
+        return self.end - self.start + 1
+
+    @property
+    def head(self) -> str:
+        return self.lines[0].strip()
+
+    @property
+    def indent(self) -> int:
+        return _indent(self.lines[0])
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def _indent(line: str) -> int:
+    return len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())
+
+
+def split_blocks(text: str) -> list[Block]:
+    """Every block in the file, outermost first, in file order.
+
+    A block is a line plus everything indented under it, plus a closing line
+    (`}`, `</div>`, `end`) back at its own indentation. Blocks are
+    listed and then split into their children too, so both "the whole
+    <main>" and "this one card inside it" can be chosen.
+    """
+    lines = text.splitlines()
+    out: list[Block] = []
+
+    def walk(lo: int, hi: int, depth: int) -> None:
+        i = lo
+        while i < hi:
+            if not lines[i].strip():
+                i += 1
+                continue
+            ind = _indent(lines[i])
+            j = i + 1
+            while j < hi and (not lines[j].strip() or _indent(lines[j]) > ind):
+                j += 1
+            has_closer = j < hi and _indent(lines[j]) == ind and bool(_CLOSER_RE.match(lines[j]))
+            if has_closer:
+                j += 1
+            end = j - 1
+            while end > i and not lines[end].strip():
+                end -= 1
+            out.append(Block(i + 1, end + 1, depth, lines[i : end + 1]))
+            if end > i:
+                inner_hi = end if has_closer else end + 1
+                walk(i + 1, inner_hi, depth + 1)
+            i = j
+
+    walk(0, len(lines), 0)
+    _link_css_to_markup(out, lines)
+    return out
+
+
+_CLASS_RULE_RE = re.compile(r"^\.([a-zA-Z][\w-]*)")
+
+
+def _link_css_to_markup(blocks: list[Block], lines: list[str]) -> None:
+    """Note where each `.class {` rule is used, e.g. `.book-btn` ->
+    `<button class="book-btn">Book Now</button>`. People name things by what
+    the page shows ("the Book Now buttons"); CSS names them by class. The
+    usage line bridges the two, for ranking and for the model's choice."""
+    for b in blocks:
+        m = _CLASS_RULE_RE.match(b.head)
+        if not m or b.size < 2:
+            continue
+        pattern = re.compile(r"class=\"[^\"]*\b" + re.escape(m.group(1)) + r"\b")
+        use = next((ln.strip() for ln in lines if pattern.search(ln)), "")
+        b.used_by = use[:100]
+
+
+# Code abbreviates what people spell out: "buttons" must find `.book-btn`.
+_ABBREVIATIONS = {
+    "btn": "button", "bg": "background", "nav": "navigation", "img": "image", "msg": "message",
+    "txt": "text", "num": "number", "idx": "index", "cfg": "config", "auth": "login",
+    "colour": "color", "grey": "gray",
+}
+_STATE_RE = re.compile(r":(hover|focus|active|visited|before|after)\b")
+
+
+def _words(text: str) -> set[str]:
+    words = set(_WORD_RE.findall(text.lower()))
+    words |= {_ABBREVIATIONS[w] for w in words if w in _ABBREVIATIONS}
+    # crude stems so "colours"/"colour", "buttons"/"button" meet
+    return words | {w[:-1] for w in words if w.endswith("s") and len(w) > 4}
+
+
+def request_words(request: str) -> set[str]:
+    return {w for w in _words(request) if w not in _STOPWORDS}
+
+
+def _score(block: Block, words: set[str]) -> float:
+    hits = len(words & (_words(block.text) | _words(block.used_by)))
+    head_hits = len(words & _words(block.head))
+    # The head line names a block ("header {", "<footer>", "def save"),
+    # so a match there counts double; big blocks are mildly penalised so
+    # the specific rule beats the container it sits in.
+    score = (hits + head_hits) / (1 + block.size / 80)
+    # `.btn:hover` is a variant of `.btn` - the base rule is what "make the
+    # buttons red" means, unless the request is about hovering itself.
+    state = _STATE_RE.search(block.head)
+    if state and state.group(1) not in words:
+        score *= 0.5
+    return score
+
+
+def outline(blocks: list[Block], limit: int = MAX_CHOICES) -> list[Block]:
+    """The file's main multi-line blocks (functions, rules, sections), for
+    when the request shares no words with the code ("handle empty lists")
+    and the model has to judge from what the blocks are."""
+    main = [b for b in blocks if b.depth <= 1 and 2 <= b.size <= MAX_REWRITE_LINES]
+    return main[:limit]
+
+
+def candidates(blocks: list[Block], request: str, limit: int = MAX_CHOICES) -> list[Block]:
+    """The blocks most likely to need changing, back in file order."""
+    words = request_words(request)
+    # Single lines deep inside a block (one CSS property, one statement)
+    # would crowd the list; near the top level they're real elements
+    # (<title>, an import) and stay.
+    usable = [b for b in blocks if b.size <= MAX_REWRITE_LINES and (b.size > 1 or b.depth <= 2)]
+    ranked = sorted(usable, key=lambda b: (-_score(b, words), b.size))
+    picked: list[Block] = []
+    same_head: dict[str, int] = {}
+    for b in ranked:
+        if len(picked) >= limit or _score(b, words) <= 0:
+            break
+        # Four identical `<div class="stall">` cards would fill half the
+        # list; two are enough to show the model that kind of block.
+        if same_head.get(b.head, 0) >= 2:
+            continue
+        same_head[b.head] = same_head.get(b.head, 0) + 1
+        picked.append(b)
+    return sorted(picked, key=lambda b: b.start)
+
+
+_WRAPPER_RE = re.compile(r"^<(!doctype|html|head|body|style|script)\b", re.IGNORECASE)
+
+
+def obvious_place(blocks: list[Block], request: str) -> Block | None:
+    """Where "add another X" goes, when code can tell without asking.
+
+    If the page has a run of look-alike blocks (stall cards, list items)
+    whose first line shares a word with the request, the new one goes after
+    the last of them. Rule first, model only when the rule has no answer.
+    """
+    added = _added_thing(request)
+    if not added:
+        return None
+    best = None
+    for b in places(blocks):
+        twins = [x for x in blocks if x.head == b.head and x.depth == b.depth and x.size >= 2]
+        if len(twins) >= 2 and twins[-1] is b and added & _words(b.head):
+            best = b
+    return best
+
+
+_ADDED_RE = re.compile(
+    r"\b(?:add|insert|create|put|append)\s+(?:a|an|another|one|one more|some|\w+th|\w+nd|\w+rd|\w+st|new)?\s*"
+    r"((?:[\w-]+\s+){0,2}?[\w-]+?)(?=\s+(?:with|to|called|named|that|for|which|showing|about|in|on|at)\b|[,.]|$)",
+    re.IGNORECASE,
+)
+
+
+def _added_thing(request: str) -> set[str]:
+    """The words naming what's being added: "add a fifth stall called X" ->
+    {stall}; "add a navigation bar with links to Stalls" -> {navigation, bar}."""
+    m = _ADDED_RE.search(request)
+    return request_words(m.group(1)) if m else set()
+
+
+def places(blocks: list[Block], limit: int = MAX_PLACES) -> list[Block]:
+    """Where new code could go, as "after this block".
+
+    Document wrappers (<body>, <style>, ...) are left out: "after <body>"
+    means after </body>, outside the page. Of a run of sibling blocks only
+    the last is offered - that's where a new CSS rule or page section is
+    appended - which keeps 17 CSS rules from crowding out the page layout.
+    """
+    def parent_of(b: Block) -> Block | None:
+        enclosing = [p for p in blocks if p.depth == b.depth - 1 and p.start <= b.start and b.end <= p.end]
+        return enclosing[-1] if enclosing else None
+
+    spots = [
+        b for b in blocks
+        if b.depth <= 2 and not _WRAPPER_RE.match(b.head) and not _CLOSER_RE.match(b.lines[0])
+    ]
+    last_child: dict[int, Block] = {}
+    for b in spots:
+        parent = parent_of(b)
+        key = id(parent) if parent else -1
+        if b.depth >= 2:
+            last_child[key] = b  # later siblings overwrite earlier ones
+    keep = [b for b in spots if b.depth < 2 or last_child.get(id(parent_of(b)) if parent_of(b) else -1) is b]
+    # The last of a run of look-alike siblings at any depth - the 4th stall
+    # card, the last <li> - is where "add another one" goes, however deep
+    # the list sits.
+    groups: dict[tuple[int, str], list[Block]] = {}
+    for b in blocks:
+        if b.size >= 2:
+            parent = parent_of(b)
+            groups.setdefault((id(parent) if parent else -1, b.head), []).append(b)
+    for twins in groups.values():
+        if len(twins) >= 2 and twins[-1] not in keep:
+            keep.append(twins[-1])
+    keep.sort(key=lambda b: (b.depth, b.start))
+    return sorted(keep[:limit], key=lambda b: b.start)
+
+
+def _preview(block: Block, max_lines: int = 4) -> str:
+    shown = block.lines if block.size <= max_lines + 1 else block.lines[:max_lines] + ["    ..."]
+    base = block.indent
+    return "\n".join("    " + ln.expandtabs(4)[base:] if ln.strip() else "" for ln in shown)
+
+
+_ADDING_RE = re.compile(r"\b(add|adds|adding|insert|create|append|include|put|new|another|more)\b", re.IGNORECASE)
+
+
+def is_adding(request: str) -> bool:
+    return bool(_ADDING_RE.search(request))
+
+
+def adds_something_absent(blocks: list[Block], request: str) -> bool:
+    """ "add a footer" to a page with no footer anywhere: nothing to choose
+    from, it's new code - decided by code, without a question."""
+    added = _added_thing(request)
+    if not added:
+        return False
+    return not any(added & _words(b.text) for b in blocks)
+
+
+def choose_prompt(request: str, rel: str, choices: list[Block]) -> str:
+    listing = "\n\n".join(
+        f"[{n}] lines {b.start}-{b.end}:\n{_preview(b)}" + (f"\n    (used by: {b.used_by})" if b.used_by else "")
+        for n, b in enumerate(choices, 1)
+    )
+    # "Something new" is a numbered option, not a word to type: small models
+    # pick from a list far more reliably than they volunteer "NEW". It's
+    # only offered when the task adds something - otherwise "handle empty
+    # lists" gets a second copy of the function instead of a fixed one.
+    new = len(choices) + 1
+    none_option = (
+        f"[{new}] NONE of the above - the task adds a new part that isn't in the file yet\n\n"
+        if is_adding(request) else ""
+    )
+    return (
+        f"Task: {request}\nFile: {rel}\n\nParts of the file:\n\n{listing}\n\n"
+        f"{none_option}"
+        "Which ONE number fits the task? Pick the most specific match - a rule or element\n"
+        "named after the thing in the task beats a general one. For adding, removing or\n"
+        "changing something ON the page pick the HTML element, not its CSS - CSS only when\n"
+        "the task is about looks (colour, size, font, spacing). Reply with just the number."
+    )
+
+
+def place_prompt(request: str, rel: str, spots: list[Block]) -> str:
+    listing = "\n".join(
+        f"[{n}] after lines {b.start}-{b.end}: {'  ' * b.depth}{b.head[:70]}" for n, b in enumerate(spots, 1)
+    )
+    return (
+        f"Task: {request}\nFile: {rel}\n\nNew code must be added. The file's structure:\n{listing}\n\n"
+        "After which numbered part should the new code go? Reply with just the number."
+    )
+
+
+def rewrite_prompt(request: str, rel: str, block: Block) -> str:
+    return (
+        f"Task: {request}\nFile: {rel} (lines {block.start}-{block.end} shown)\n\n```\n{block.text}\n```\n\n"
+        "Rewrite ONLY these lines so the task is done. Keep everything else in them the same.\n"
+        "Reply with the complete new version of these lines in one ``` block, nothing else."
+    )
+
+
+def _tail(block: Block, max_lines: int = 4) -> str:
+    """The end of a block - what sits directly above code inserted after it."""
+    if block.size <= max_lines + 1:
+        return block.text
+    return "\n".join([block.lines[0], "    ..."] + block.lines[-(max_lines - 1):])
+
+
+def new_code_prompt(request: str, rel: str, after: Block) -> str:
+    return (
+        f"Task: {request}\nFile: {rel}\n\nThe new code goes right after this (already complete - "
+        f"don't close or repeat any of it):\n```\n{_tail(after)}\n```\n\n"
+        "Write ONLY the new code to add there - not the existing code, not the whole file.\n"
+        "Reply with it in one ``` block, nothing else."
+    )
+
+
+def parse_choice(reply: str, count: int) -> int | str | None:
+    """A 1-based choice, "NEW", or None if the reply says neither."""
+    text = re.sub(r"<think>.*?(</think>|$)", "", reply, flags=re.DOTALL | re.IGNORECASE).strip()
+    m = re.search(r"\d+", text)
+    if m and 1 <= int(m.group()) <= count:
+        return int(m.group())
+    if m and int(m.group()) == count + 1:
+        return "NEW"  # the "none of the above" option choose_prompt adds
+    if re.search(r"\bNEW\b", text, re.IGNORECASE):
+        return "NEW"
+    return None
+
+
+_FENCE_RE = re.compile(r"```[^\n]*\n(.*?)(?:```|$)", re.DOTALL)
+
+
+def extract_code(reply: str) -> str | None:
+    """The fenced code in a reply: None if there's no block at all, "" for
+    an empty block - which, for a rewrite, means "delete these lines"."""
+    m = _FENCE_RE.search(reply)
+    if m is None:
+        return None
+    code = m.group(1).rstrip()
+    return code if code.strip() else ""
+
+
+def looks_like_whole_file(code: str, block: Block | None) -> bool:
+    """The model wrote the entire file instead of the part it was asked for."""
+    markers = ("<!doctype", "<html")
+    lowered = code.lower()
+    if block is not None and any(m in block.text.lower() for m in markers):
+        return False
+    return any(m in lowered for m in markers)
+
+
+_LONE_CLOSER_RE = re.compile(r"^\s*</([a-zA-Z][\w-]*)\s*>\s*$")
+_LONE_OPENER_RE = re.compile(r"^\s*<([a-zA-Z][\w-]*)(?:\s[^>]*)?>\s*$")
+
+
+def trim_stray_closers(code: str) -> str:
+    """Drop closing tags dangling at the start of new markup.
+
+    Shown the end of a <div> and asked for "a footer after it", a small
+    model often re-closes things first: `</div>\n</div>\n<footer>`. Those
+    closers belong to the existing code, not the new part; leaving them in
+    would close the page's containers early.
+    """
+    lines = code.splitlines()
+    while lines and (not lines[0].strip() or _LONE_CLOSER_RE.match(lines[0])):
+        lines.pop(0)
+    return "\n".join(lines)
+
+
+_AND_THEN_RE = re.compile(
+    r"\s*(?:,\s*)?\b(?:and|then|also|plus)\s+(?=(?:also\s+)?(?:add|make|change|remove|delete|put|set|turn|"
+    r"move|create|insert|update|use|give|replace|rename|fix)\b)",
+    re.IGNORECASE,
+)
+
+
+_PRONOUN_RE = re.compile(r"\b(it|its|them|they|this|that|these|those)\b", re.IGNORECASE)
+
+
+def split_request(request: str) -> list[str]:
+    """ "make the header green and add a footer" -> two requests.
+
+    Each FIX handles one block. Joined requests otherwise get half-done: the
+    header changes, the footer is forgotten, and the step reads as success.
+    Only splits before a verb, so "a red and white header" stays whole.
+    """
+    parts: list[str] = []
+    for part in (p.strip(" ,.") for p in _AND_THEN_RE.split(request)):
+        if not part:
+            continue
+        # "add a nav bar and make it sticky": "it" needs the part before it.
+        if parts and _PRONOUN_RE.search(part):
+            parts[-1] = f"{parts[-1]} and {part}"
+        else:
+            parts.append(part)
+    return parts or [request]
+
+
+def match_indent(code: str, target_indent: int) -> str:
+    """Shift a block so its first line sits at `target_indent`, keeping the
+    relative indentation inside it."""
+    lines = code.splitlines()
+    first = next((ln for ln in lines if ln.strip()), None)
+    if first is None:
+        return code
+    shift = target_indent - _indent(first)
+    if shift == 0:
+        return code
+    out = []
+    for ln in lines:
+        if not ln.strip():
+            out.append("")
+        elif shift > 0:
+            out.append(" " * shift + ln)
+        else:
+            out.append(ln[min(-shift, _indent(ln)):])
+    return "\n".join(out)

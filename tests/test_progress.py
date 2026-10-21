@@ -118,7 +118,7 @@ class Checker:
         yield self.verdict
 
 
-def test_premature_done_is_sent_back_once_with_whats_missing(tmp_path):
+def test_premature_done_is_sent_back_with_whats_missing_at_most_twice(tmp_path):
     # Seen live: asked for a green header AND a footer, the model changed the
     # header and said DONE.
     client = Checker("NO - the footer with contact info was never added.")
@@ -132,8 +132,11 @@ def test_premature_done_is_sent_back_once_with_whats_missing(tmp_path):
     assert "footer" in result
 
     result, finished = agent._handle_action(parse_action("DONE"), None)
-    assert finished is True, "only checked once per request - a stubborn NO can't trap the model"
-    assert client.calls == 1
+    assert finished is False, "checked a second time"
+
+    result, finished = agent._handle_action(parse_action("DONE"), None)
+    assert finished is True, "capped per request - a stubborn NO can't trap the model"
+    assert client.calls == 2
 
 
 def test_done_is_accepted_when_the_check_agrees(tmp_path):
@@ -142,3 +145,18 @@ def test_done_is_accepted_when_the_check_agrees(tmp_path):
     agent.progress.start("make the header green")
 
     assert agent._handle_action(parse_action("DONE"), None) == (None, True)
+
+
+def test_a_fix_is_recorded_by_what_it_did_not_what_it_was_asked():
+    p = Progress()
+    p.start("make the header green and add a footer")
+    p.record("FIX index.html: make the header green and add a footer",
+             "Applied (rewrote lines 15-20, header {). index.html now reflects the change. self-review: YES\nfine")
+    assert p.steps[-1] == "FIX index.html: rewrote lines 15-20, header { -> ok"
+
+
+def test_note_lists_project_files():
+    p = Progress()
+    p.start("add a footer")
+    p.set_project_files([("index.html", 176)])
+    assert "Project files: index.html (176 lines)" in p.render()
