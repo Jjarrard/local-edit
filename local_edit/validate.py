@@ -205,6 +205,12 @@ def _validate_html(text: str) -> ValidationResult:
     content. CSS never has a line starting with a tag, so that's a definite
     mistake. (<script> isn't checked: JS template strings hold markup.)
     """
+    end = re.search(r"</html\s*>", text, re.IGNORECASE)
+    if end and text[end.end():].strip():
+        line = text.count("\n", 0, end.end()) + 2
+        return ValidationResult.bad(
+            f"content after </html> at line {line} - page content belongs inside <body>"
+        )
     for block in _STYLE_BLOCK_RE.finditer(text):
         tag = _TAG_LINE_RE.search(block.group(1))
         if tag:
@@ -217,6 +223,37 @@ def _validate_html(text: str) -> ValidationResult:
 
 
 VALIDATORS.update({suffix: _validate_html for suffix in (".html", ".htm")})
+
+
+_BALANCED_TAGS = ("div", "section", "main", "header", "footer", "nav", "article", "aside", "form",
+                  "ul", "ol", "table", "tr", "button", "a", "p", "span", "label", "select")
+
+
+def html_tag_balance(text: str) -> dict[str, int]:
+    """Opened minus closed, per container tag, ignoring <style>/<script>
+    bodies (JS template strings hold markup)."""
+    body = re.sub(r"<(style|script)\b.*?</\1\s*>", "", text, flags=re.DOTALL | re.IGNORECASE).lower()
+    out = {}
+    for tag in _BALANCED_TAGS:
+        opened = len(re.findall(rf"<{tag}(?:\s[^>]*)?>", body))
+        closed = len(re.findall(rf"</{tag}\s*>", body))
+        if opened != closed:
+            out[tag] = opened - closed
+    return out
+
+
+def html_balance_change(old_text: str, new_text: str) -> str | None:
+    """How an edit changed tag balance, if it did - an extra </div> or a
+    <footer> never closed. Compared to before, not to perfection, so a page
+    that was already a little sloppy can still be edited."""
+    before, after = html_tag_balance(old_text), html_tag_balance(new_text)
+    for tag in sorted(set(before) | set(after)):
+        delta = after.get(tag, 0) - before.get(tag, 0)
+        if delta > 0:
+            return f"it opens {delta} more <{tag}> than it closes"
+        if delta < 0:
+            return f"it closes {-delta} more <{tag}> than it opens (a stray </{tag}>)"
+    return None
 
 
 def register_validator(suffix: str, fn: Callable[[str], ValidationResult]) -> None:

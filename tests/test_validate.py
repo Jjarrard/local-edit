@@ -123,3 +123,11 @@ def test_markup_inside_a_style_block_is_rejected():
     fine = "<html><head><style>\nbody { margin: 0; }\n</style></head><body><footer>x</footer>\n" \
            "<script>el.innerHTML = `\n<div class=\"card\">`;</script></body></html>"
     assert validate("index.html", fine).ok
+
+
+def test_content_after_closing_html_is_rejected():
+    # Seen live: INSERT index.html 176 appended a new stall after </html>.
+    from local_edit.validate import validate
+
+    assert not validate("index.html", "<html><body></body></html>\n<div class=\"stall\">x</div>\n").ok
+    assert validate("index.html", "<html><body></body></html>\n\n").ok
