@@ -12,7 +12,6 @@ and a validator that can't run never blocks an edit.
 
 from __future__ import annotations
 
-import ast
 import configparser
 import json
 import re
@@ -45,7 +44,10 @@ class ValidationResult:
 
 def _validate_python(text: str) -> ValidationResult:
     try:
-        ast.parse(text)
+        # compile, not ast.parse: `return` outside a function parses fine
+        # and only fails here - and a FIX that appends body code after a
+        # function produces exactly that.
+        compile(text, "<edit>", "exec", dont_inherit=True)
     except SyntaxError as exc:
         where = f"line {exc.lineno}" if exc.lineno else "unknown line"
         return ValidationResult.bad(f"Python syntax error at {where}: {exc.msg}")

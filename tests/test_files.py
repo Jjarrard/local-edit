@@ -138,9 +138,11 @@ def test_plan_insert_at_end_of_file(project):
     assert result.new_text.rstrip("\n").endswith("# trailing comment")
 
 
-def test_plan_insert_out_of_bounds(project):
-    with pytest.raises(files.PathError):
-        files.plan_insert(project, "src/app.py", 999, "x")
+def test_plan_insert_past_the_end_appends(project):
+    # "after line 14" of a 13-line file: models count the next free line
+    result = files.plan_insert(project, "src/app.py", 999, "x")
+    assert result.new_text.splitlines()[-1] == "x"
+    assert result.new_text.startswith(result.old_text)
 
 
 def test_plan_insert_negative_line_out_of_bounds(project):

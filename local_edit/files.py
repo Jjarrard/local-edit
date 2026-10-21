@@ -194,8 +194,11 @@ def plan_insert(root: Path, rel: str, after_line: int, new_text: str) -> EditRes
     old_text = "" if is_new else path.read_text(errors="replace")
     lines = old_text.splitlines()
     n = len(lines)
-    if after_line < 0 or after_line > n:
+    if after_line < 0:
         raise PathError(f"insert point {after_line} is out of bounds for '{rel}' ({n} lines)")
+    # "After line 14" of a 13-line file can only mean the end: models count
+    # the next free line, and rejecting it just costs another turn.
+    after_line = min(after_line, n)
     insertion = new_text.splitlines()
     new_lines = lines[:after_line] + insertion + lines[after_line:]
     new_full = "\n".join(new_lines) + "\n"

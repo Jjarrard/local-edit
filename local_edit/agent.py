@@ -10,6 +10,7 @@ Two modes share the same step machinery:
 from __future__ import annotations
 
 import contextlib
+import difflib
 import re
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from .state import STATUS_BLOCKED, STATUS_DONE, STATUS_IN_PROGRESS, Session
 
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_MAX_STEPS = 12
+MAX_PLANNED_STEPS = 5  # a planner asked for "3-7" pads to 7 with jobs it has no tool for
 
 # Local models run with small windows - and llama.cpp's --parallel N divides
 # the context between slots, so a server started with --ctx-size 8192
@@ -555,6 +557,9 @@ class Agent:
         if kind == "FIX":
             return self._handle_fix(action, active_todo)
 
+        if kind == "CREATE":
+            return self._handle_create(action, active_todo)
+
         if kind in ("EDIT", "INSERT", "DELETE"):
             return self._handle_write(action, active_todo)
 
@@ -698,6 +703,15 @@ class Agent:
         request = action.text or self.progress.goal or ""
         if not request:
             return "ERROR: FIX needs to say what to change, e.g. FIX index.html make the header green", False
+        if action.path.lower().endswith((".html", ".htm")):
+            sheet = focus.stylesheet_for(target.read_text(errors="replace"), request)
+            sheet_rel = (Path(action.path).parent / sheet).as_posix() if sheet else None
+            if sheet_rel and (self.root / sheet_rel).is_file():
+                # "make the header green" on a page styled from style.css:
+                # the change is a CSS rule, not inline styles on <body>.
+                self.console.print(f"[dim](styles for {action.path} live in {sheet_rel} - changing that)[/dim]")
+                action = Action(kind="FIX", path=sheet_rel, text=action.text, raw=action.raw)
+                target = files.resolve(self.root, sheet_rel)
         parts = focus.split_request(request)
         if len(parts) > 1:
             self.console.print(f"[dim](doing this as {len(parts)} separate changes)[/dim]")
@@ -744,6 +758,8 @@ class Agent:
         if isinstance(choice, int):
             # 2a. rewrite just that block
             block = choices[choice - 1]
+            if rel.endswith(".py"):
+                block = focus.enclosing_function(blocks, block) or block
             self.console.print(f"[dim](rewriting lines {block.start}-{block.end}: {block.head[:60]})[/dim]")
             code = self._ask_for_code(focus.rewrite_prompt(request, rel, block), block)
             if code is None:
@@ -770,14 +786,143 @@ class Agent:
             code = focus.trim_stray_closers(code) if code else code
             if not code:
                 return f"ERROR: FIX {rel}: no usable new code came back", False
-            edit = Action(kind="INSERT", path=rel, start=after.end,
-                          payload=focus.match_indent(code, after.indent))
-            where = f"added {len(code.splitlines())} lines after line {after.end}, {after.head[:40]}"
+            owner = self._function_for_body_code(rel, blocks, after, request, ranking_text, code)
+            if owner is not None:
+                # `if not numbers: raise ...` belongs inside a function, not
+                # after it - so the change is a rewrite of that function.
+                self.console.print(f"[dim](that code goes inside {owner.head[:50]} - rewriting it instead)[/dim]")
+                code = self._ask_for_code(focus.rewrite_prompt(request, rel, owner), owner)
+                if not code:
+                    return f"ERROR: FIX {rel}: no usable rewrite of lines {owner.start}-{owner.end} came back", False
+                edit = Action(kind="EDIT", path=rel, start=owner.start, end=owner.end,
+                              payload=focus.match_indent(code, owner.indent))
+                where = f"rewrote lines {owner.start}-{owner.end}, {owner.head[:40]}"
+            else:
+                edit = Action(kind="INSERT", path=rel, start=after.end,
+                              payload=focus.match_indent(code, after.indent))
+                where = f"added {len(code.splitlines())} lines after line {after.end}, {after.head[:40]}"
 
         result_text, finished = self._handle_write(edit, active_todo, task_text=request, from_fix=True)
         if result_text and result_text.startswith("Applied."):
             result_text = f"Applied ({where})." + result_text[len("Applied."):]
         return result_text, finished
+
+    @staticmethod
+    def _function_for_body_code(rel, blocks, after, request, ranking_text, code):
+        """The function new Python code should go inside, when it's about to
+        land at the top level and can't stand there: the function the
+        request names, else the one it was placed after, else the best
+        match. None when the code is fine where it is."""
+        if not rel.endswith(".py") or after.indent > 0 or not focus.is_body_code(code):
+            return None
+        is_def = re.compile(r"^(?:async\s+def|def|class)\s+(\w+)")
+        defs = [b for b in blocks if b.depth == 0 and is_def.match(b.head)]
+        words = set(re.findall(r"\w+", request.lower()))
+        named = [b for b in defs if is_def.match(b.head).group(1).lower() in words]
+        if named:
+            return named[0]
+        if after in defs:
+            return after
+        ranked = [b for b in focus.candidates(blocks, ranking_text) if b in defs]
+        return ranked[0] if ranked else None
+
+    # -- CREATE: the model names a new file, the harness asks for it ------------
+
+    def _create_context(self, rel: str) -> str:
+        """What a new file has to fit: for a script or stylesheet, the ids
+        and classes the pages already use; for a page, the stylesheets and
+        scripts it should load. Code collects it so the model needn't READ."""
+        suffix = Path(rel).suffix.lower()
+        others = [r for r, _ in files.project_files(self.root) if r != rel]
+        if suffix in (".js", ".css"):
+            parts = []
+            for page in [r for r in others if r.lower().endswith((".html", ".htm"))][:2]:
+                hooks = focus.markup_hooks(files.resolve(self.root, page).read_text(errors="replace"))
+                if hooks:
+                    parts.append(f"{page} has these elements - use these exact ids and classes:\n"
+                                 + "\n".join(f"  {h}" for h in hooks))
+            return "\n\n".join(parts) + "\n\n" if parts else ""
+        if suffix in (".html", ".htm"):
+            assets = [r for r in others if r.lower().endswith((".css", ".js"))]
+            if assets:
+                return "Load these existing files in the page: " + ", ".join(assets) + "\n\n"
+        if others:
+            return "Other files in the project: " + ", ".join(others) + "\n\n"
+        return ""
+
+    def _handle_create(self, action: Action, active_todo) -> tuple[str | None, bool]:
+        try:
+            target = files.resolve(self.root, action.path)
+        except files.PathError as exc:
+            return f"ERROR: {exc}", False
+        if target.is_file() and target.read_text(errors="replace").strip():
+            return f"ERROR: {action.path} already exists - change it with FIX {action.path} <what to change>", False
+        goal = self.progress.goal or ""
+        what = action.text or (active_todo.text if active_todo else goal) or f"the {action.path} the task needs"
+        prompt = focus.create_prompt(action.path, what, goal, self._create_context(action.path))
+        code = focus.extract_code(self._ask(prompt, label="write"))
+        if not code:
+            return f"ERROR: CREATE {action.path}: no file content came back", False
+        edit = Action(kind="INSERT", path=action.path, start=0, payload=code)
+        result_text, finished = self._handle_write(edit, active_todo, task_text=what, from_fix=True)
+        if result_text and result_text.startswith("Applied."):
+            result_text = f"Created {action.path} ({len(code.splitlines())} lines)." \
+                + result_text[len("Applied."):].replace(" now reflects the change.", "", 1)
+        return result_text, finished
+
+    def _link_assets(self, rel: str) -> str:
+        """Hook a new stylesheet or script into the page, or a new page up to
+        the stylesheets and scripts beside it - only when there's one page,
+        so which page is never a guess. Returns a note for the model."""
+        folder = Path(rel).parent
+        pages = [r for r, _ in files.project_files(self.root, limit=50)
+                 if r.lower().endswith((".html", ".htm")) and Path(r).parent == folder]
+        if len(pages) != 1:
+            return ""
+        page = pages[0]
+        if rel == page:
+            assets = [r for r, _ in files.project_files(self.root, limit=50)
+                      if r.lower().endswith((".css", ".js")) and Path(r).parent == folder]
+        else:
+            assets = [rel] if rel.lower().endswith((".css", ".js")) else []
+        path = files.resolve(self.root, page)
+        old = text = path.read_text(errors="replace")
+        linked = []
+        for asset in assets:
+            name = Path(asset).name
+            if name in text:
+                continue
+            if asset.endswith(".css") and re.search(r"</head>", text, re.IGNORECASE):
+                text = re.sub(r"(?i)([ \t]*)</head>", lambda m: f'{m.group(1)}    <link rel="stylesheet" href="{name}">\n{m.group(0)}', text, count=1)
+            elif asset.endswith(".js") and re.search(r"</body>", text, re.IGNORECASE):
+                text = re.sub(r"(?i)([ \t]*)</body>", lambda m: f'{m.group(1)}    <script src="{name}"></script>\n{m.group(0)}', text, count=1)
+            else:
+                continue
+            linked.append(name)
+        if not linked:
+            return ""
+        files.write(self.root, page, text)
+        self.session.backup_and_record(page, old, text, False)
+        self.progress.note_file(page, len(text.splitlines()))
+        self.console.print(f"[dim](linked {', '.join(linked)} from {page})[/dim]")
+        return f" Linked {', '.join(linked)} from {page}."
+
+    def _complete_imports(self, result: files.EditResult) -> str:
+        """Add names the edit started using to the file's existing import
+        from a sibling module (see focus.complete_imports). Works on the
+        proposed text, before it's checked, so the check sees the import."""
+        folder = Path(result.rel).parent
+        modules = {}
+        for other, _ in files.project_files(self.root, limit=50):
+            if other.endswith(".py") and other != result.rel and Path(other).parent == folder:
+                modules[Path(other).stem] = files.resolve(self.root, other).read_text(errors="replace")
+        new_text, added = focus.complete_imports(result.new_text, modules)
+        if not added:
+            return ""
+        result.new_text = new_text
+        result.diff = files.diff_texts(result.rel, result.old_text, new_text)
+        self.console.print(f"[dim](importing {', '.join(added)} in {result.rel})[/dim]")
+        return f" Imported {', '.join(added)} in {result.rel}."
 
     def _unrequested_new_file(self, action: Action) -> str | None:
         """Push back, once, on a new file nobody asked for.
@@ -891,6 +1036,7 @@ class Agent:
         # Structural check before anything else: a syntactically broken edit
         # is never worth a review round-trip or the user's attention, and it
         # gives the model a precise error to fix instead of silent breakage.
+        import_note = ""
         check = validate.validate(result.rel, result.new_text)
         if not check.ok:
             self.validation_failures += 1
@@ -900,6 +1046,24 @@ class Agent:
                 f"The file was NOT changed. READ the relevant lines again and send a corrected edit.",
                 False,
             )
+
+        if result.rel.endswith(".py"):
+            import_note = self._complete_imports(result)
+            unknown = sorted(focus.undefined_names(result.new_text) - focus.undefined_names(result.old_text))
+            if unknown:
+                self.validation_failures += 1
+                words = set(re.findall(r"[A-Za-z_]\w*", result.new_text))
+                problems = []
+                for fn, name in unknown[:3]:
+                    near = difflib.get_close_matches(name, sorted(words - {name}), n=1, cutoff=0.6)
+                    problems.append(f"{fn}() uses {name}, which is never defined"
+                                    + (f" - did you mean {near[0]}?" if near else ""))
+                self.console.print(f"[bold red]rejected (undefined name):[/bold red] {problems[0]}")
+                return (
+                    f"ERROR: that {action.kind} would break {result.rel} - " + "; ".join(problems)
+                    + ". The file was NOT changed.",
+                    False,
+                )
 
         if result.rel.lower().endswith((".html", ".htm")):
             unbalanced = validate.html_balance_change(result.old_text, result.new_text)
@@ -1005,7 +1169,8 @@ class Agent:
                     f" WARNING: {result.rel} is unfinished - {tags} never closed, so the page will "
                     f"render blank. INSERT the rest after line {line_count} before saying it's done."
                 )
-        return f"Applied. {result.rel} now reflects the change.{review_note}{incomplete_note}", False
+        link_note = import_note + (self._link_assets(result.rel) if result.is_new_file else "")
+        return f"Applied. {result.rel} now reflects the change.{link_note}{review_note}{incomplete_note}", False
 
     # -- shell commands -----------------------------------------------------
 
@@ -1121,11 +1286,66 @@ class Agent:
 
     # -- autonomous work loop -----------------------------------------------------
 
+    _CHECKING_TODO_RE = re.compile(
+        r"^\W*(verify|confirm|check|test|ensure|validate|make sure|review|double[- ]check|optimi[sz]e)\b",
+        re.IGNORECASE,
+    )
+    _FILE_TOKEN_RE = re.compile(r"(?<![\w.@])/?(?:[\w-]+/)*[\w-]+\.(?:html?|css|js|ts|jsx|tsx|py|json|md|txt)\b")
+
+    def _usable_todos(self, items: list[str], goal: str) -> list[str]:
+        """Drop the todos a 4B planner pads its list with.
+
+        Asked to make a header green, it plans seven: "test responsiveness
+        on mobile", "confirm no conflicts" - jobs it has no tool for, which
+        burn a dozen steps each and end blocked. And planning before it has
+        seen the folder, it invents /src/blog.html. Code knows which files
+        exist, so it fixes near-misses (styles.css -> style.css) and drops
+        items about files that are neither there nor asked for.
+        """
+        existing = [rel for rel, _ in files.project_files(self.root, limit=200)]
+        by_name: dict[str, list[str]] = {}
+        for rel in existing:
+            by_name.setdefault(Path(rel).name.lower(), []).append(rel)
+        goal_lower = goal.lower()
+        keep: list[str] = []
+        for text in items:
+            verb = self._CHECKING_TODO_RE.match(text)
+            if verb and verb.group(1).lower() not in goal_lower:
+                continue
+            ok = True
+
+            def fix_path(m: re.Match) -> str:
+                nonlocal ok
+                token = m.group(0)
+                bare = token.lstrip("/")
+                if bare in existing:
+                    return bare
+                name = Path(bare).name.lower()
+                if len(by_name.get(name, [])) == 1:
+                    return by_name[name][0]
+                if name in goal_lower:
+                    return bare  # a new file the goal asks for
+                close = difflib.get_close_matches(name, list(by_name), n=1, cutoff=0.8)
+                if close and len(by_name[close[0]]) == 1:
+                    return by_name[close[0]][0]
+                ok = False
+                return token
+
+            fixed = self._FILE_TOKEN_RE.sub(fix_path, text)
+            if ok:
+                keep.append(fixed)
+        return keep[:MAX_PLANNED_STEPS]
+
     def plan(self, goal: str, attempts: int = 3) -> None:
+        project = files.project_files(self.root, limit=12)
+        listing = ", ".join(f"{rel} ({n} lines)" for rel, n in project) or "none - the folder is empty"
         prompt = (
             f"Goal: {goal}\n"
-            "Break this into 3-7 concrete todo items using only `TODO ADD <text>` lines, "
-            "one per line, most important first. No other commands or explanation."
+            f"Files in the project: {listing}\n\n"
+            f"Break the goal into 1-{MAX_PLANNED_STEPS} todo items - as FEW as it really needs - using only "
+            "`TODO ADD <text>` lines, one per line, in the order to do them. Each item is ONE change to ONE "
+            "file, named in the item: a file listed above, or a new file the goal needs. No items for "
+            "testing, checking or verifying. No other commands or explanation."
         )
         self.session.add_message("user", prompt)
         last_signature: str | None = None
@@ -1136,7 +1356,7 @@ class Agent:
                 self._messages(), label="plan", model=self.fast_model, waiting_message="planning"
             )
             self.session.add_message("assistant", raw)
-            items = parse_todo_adds(raw)
+            items = self._usable_todos(parse_todo_adds(raw), goal)
             if items:
                 for text in items:
                     item = self.session.todos.add(text)
@@ -1182,7 +1402,7 @@ class Agent:
         self.console.print(f"\n[bold]--- working on #{todo.id}: {todo.text} ---[/bold]")
         prompt = (
             f"Active task (TODO #{todo.id}): {todo.text}\n"
-            f"Work only on this task. READ the relevant file(s) before you EDIT/INSERT/DELETE. "
+            f"Work only on this task: FIX an existing file, CREATE a new one. "
             f"When it's fully done, reply with TODO DONE {todo.id}."
         )
         self.session.add_message("user", prompt)

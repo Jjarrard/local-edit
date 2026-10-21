@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-COMMANDS = ("SAY", "LIST", "READ", "GREP", "RUN", "TODO", "FIX", "EDIT", "INSERT", "DELETE", "DONE")
+COMMANDS = ("SAY", "LIST", "READ", "GREP", "RUN", "TODO", "FIX", "CREATE", "EDIT", "INSERT", "DELETE", "DONE")
 
 # Models dress their commands up. DeepSeek-R1 writes "COMMAND: INSERT x 0";
 # others use markdown bullets, numbered steps, block quotes, bold, or inline
@@ -166,7 +166,7 @@ def find_bare_shell_command(text: str) -> str | None:
     return None
 
 
-_FILE_COMMANDS = ("FIX", "EDIT", "INSERT", "DELETE")
+_FILE_COMMANDS = ("FIX", "CREATE", "EDIT", "INSERT", "DELETE")
 
 
 def _later_file_command(text: str, from_pos: int) -> Action | None:
@@ -222,6 +222,12 @@ def parse_action(raw_text: str) -> Action:
         if file_action is not None:
             return file_action
         message = (rest_of_line + "\n" + after_cmd).strip()
+        # "SAY the script tag is already there. TODO DONE 4" - the verdict
+        # is at the end; read as chat, the todo stalls and gets blocked.
+        done = re.search(r"\bTODO\s+DONE\s+(\d+)\W*$", message, re.IGNORECASE)
+        if done:
+            return Action(kind="TODO_DONE", preamble=message[: done.start()].strip(),
+                          todo_id=int(done.group(1)), raw=raw_text)
         return Action(kind="SAY", preamble=preamble, text=message or "(empty)", raw=raw_text)
 
     if keyword == "DONE":
@@ -292,6 +298,25 @@ def parse_action(raw_text: str) -> Action:
         return Action(
             kind="FIX", preamble=preamble, path=fm.group(1),
             text=(fm.group(2) or "").strip(" :-") or None, raw=raw_text,
+        )
+
+    if keyword == "CREATE":
+        # CREATE <path> <what it's for> - the harness asks for the content
+        # in a prompt of its own. Small models say this unprompted when a
+        # todo reads "Create app.js ...", so it's a command, not an error.
+        cm = re.match(r"^(\S+?)[:,]?(?:\s+(.*))?$", rest_of_line)
+        if not cm:
+            raise ParseError("CREATE needs a path, e.g. CREATE app.js handle adding and deleting tasks")
+        payload, truncated = _extract_fenced_block(after_cmd)
+        if payload is not None:
+            # it wrote the content anyway - that's an INSERT of a new file
+            return Action(
+                kind="INSERT", preamble=preamble, path=cm.group(1), start=0,
+                payload=payload, payload_truncated=truncated, raw=raw_text,
+            )
+        return Action(
+            kind="CREATE", preamble=preamble, path=cm.group(1),
+            text=(cm.group(2) or "").strip(" :-") or None, raw=raw_text,
         )
 
     if keyword == "EDIT":
@@ -373,6 +398,7 @@ FORMAT_REMINDER = (
     "  TODO DONE <id>                - complete a todo\n"
     "  TODO LIST                     - show todos\n"
     "  FIX <path> <what to change>   - change an existing file; say what in words\n"
+    "  CREATE <path> <what it does>  - make a new file; say what in words\n"
     "  EDIT <path> <start>-<end>     - replace those lines, followed by a ``` block\n"
     "  INSERT <path> <line>          - insert after that line, followed by a ``` block\n"
     "  DELETE <path> <start>-<end>   - delete those lines\n"
@@ -396,13 +422,17 @@ COMMANDS (your reply must start with one of these):
 {run_doc}  TODO ADD <text> | TODO DONE <id> | TODO LIST
   FIX <path> <what to change> change an existing file - say WHAT in words, no code.
                               local-edit finds the right lines and asks you to rewrite them
+  CREATE <path> <what it does> make a new file - say WHAT in words, no code.
+                              local-edit asks you for its content next
   INSERT <path> <line>        insert after that line, then a ``` block
   EDIT <path> <start>-<end>   replace exactly those lines, then a ``` block
   DELETE <path> <start>-<end> delete those lines
   DONE                        task complete
 
 RULES:
-- New file: INSERT <path> 0 with the full content. Do not READ it first.
+- New file: CREATE <path> <what it does>. Do not READ it first. Examples:
+    CREATE style.css styles for the todo list
+    CREATE app.js add, tick off and delete tasks
 - New folder: just INSERT a file inside it (INSERT assets/style.css 0) - missing parent
   folders are created automatically. For an empty folder, RUN mkdir -p assets.
 - If the request doesn't name a file, it is about a file that already exists (see

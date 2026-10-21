@@ -440,3 +440,185 @@ def match_indent(code: str, target_indent: int) -> str:
         else:
             out.append(ln[min(-shift, _indent(ln)):])
     return "\n".join(out)
+
+
+_TOP_LEVEL_RE = re.compile(
+    r"^(?:def|async\s+def|class|import|from|@|#|if\s+__name__|[A-Za-z_][\w, ]*\s*(?::[^=]+)?=(?!=)|\"\"\"|''')"
+)
+
+
+def is_body_code(code: str) -> bool:
+    """Python that only makes sense inside a function: `if not numbers:`,
+    `return price`. Asked to "handle empty lists in median()", a small model
+    picks "new code" and writes the guard alone - placed after the function,
+    at the top level, it breaks the module."""
+    first = next((ln.strip() for ln in code.splitlines() if ln.strip()), "")
+    return bool(first) and not _TOP_LEVEL_RE.match(first)
+
+
+MAX_HOOK_LINES = 30
+_HOOK_RE = re.compile(r"\b(id|class|name)=\"|<(form|input|button|ul|ol|table|select|textarea)\b", re.IGNORECASE)
+
+
+def markup_hooks(html: str, limit: int = MAX_HOOK_LINES) -> list[str]:
+    """The lines of a page that scripts and styles hang off - ids, classes,
+    form controls. A new app.js has to use the ids index.html already has;
+    this is the slice of the page that says what they are."""
+    hooks = [ln.strip() for ln in html.splitlines() if _HOOK_RE.search(ln)]
+    return [h[:120] for h in hooks[:limit]]
+
+
+def create_prompt(rel: str, what: str, goal: str, context: str) -> str:
+    goal_line = f"Overall goal: {goal}\n" if goal and goal.strip() != what.strip() else ""
+    return (
+        f"{goal_line}Write the new file {rel}. It should: {what}\n\n"
+        f"{context}"
+        f"Reply with the COMPLETE content of {rel} in one ``` block, nothing else."
+    )
+
+
+def _top_level_names(tree) -> set[str]:
+    import ast
+
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    return names
+
+
+def complete_imports(text: str, modules: dict[str, str]) -> tuple[str, list[str]]:
+    """Add names a file uses but never imported to its existing
+    `from <module> import ...` line.
+
+    A model adding test_median() to test_calc.py writes the test and leaves
+    `from calc import average, total` alone - the test then dies on a
+    NameError. Which import is missing is a fact code can look up: the name
+    is used, bound nowhere in the file, and defined at the top of a sibling
+    module the file already imports from. `modules` maps module name to
+    source. Returns the new text and the names added.
+    """
+    import ast
+    import builtins
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text, []
+    bound = set(dir(builtins))
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            (used if isinstance(node.ctx, ast.Load) else bound).add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound |= {(a.asname or a.name).split(".")[0] for a in node.names}
+    missing = used - bound
+    if not missing:
+        return text, []
+    lines = text.splitlines()
+    added: list[str] = []
+    for node in tree.body:
+        if not (isinstance(node, ast.ImportFrom) and node.module in modules and node.lineno == node.end_lineno):
+            continue
+        line = lines[node.lineno - 1]
+        if "(" in line or "*" in line or ";" in line or "#" in line:
+            continue
+        try:
+            offered = _top_level_names(ast.parse(modules[node.module]))
+        except SyntaxError:
+            continue
+        new = sorted((missing & offered) - set(added))
+        if new:
+            lines[node.lineno - 1] = line.rstrip() + ", " + ", ".join(new)
+            added += new
+    if not added:
+        return text, []
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else ""), added
+
+
+def _function_scopes(tree):
+    import ast
+
+    return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def undefined_names(text: str) -> set[tuple[str, str]]:
+    """(function, name) pairs where a function reads a name that is bound
+    nowhere - not in it, not at module level, not a builtin.
+
+    Rewriting `return round(discount, 2)` from a request that said
+    "discount_amount", a small model writes `price - discount_amount`: valid
+    syntax, a NameError the first time it runs. Compared before and after an
+    edit, so only names the edit introduced count.
+    """
+    import ast
+    import builtins
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+    module_bound = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            module_bound.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            module_bound |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            module_bound |= set(node.names)
+    for node in tree.body:
+        for sub in ast.walk(node) if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else []:
+            if isinstance(sub, ast.Name) and not isinstance(sub.ctx, ast.Load):
+                module_bound.add(sub.id)
+    out: set[tuple[str, str]] = set()
+    for fn in _function_scopes(tree):
+        bound = set()
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Name) and not isinstance(sub.ctx, ast.Load):
+                bound.add(sub.id)
+            elif isinstance(sub, ast.arg):
+                bound.add(sub.arg)
+            elif isinstance(sub, ast.ExceptHandler) and sub.name:
+                bound.add(sub.name)
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id not in bound | module_bound:
+                out.add((fn.name, sub.id))
+    return out
+
+
+def enclosing_function(blocks: list[Block], block: Block) -> Block | None:
+    """The top-level def/class around a line chosen inside it, if it's
+    small enough to rewrite whole. One line alone hides the names it can
+    use; the function shows them."""
+    if block.depth == 0:
+        return None
+    for b in blocks:
+        if (b.depth == 0 and b.start <= block.start and block.end <= b.end
+                and re.match(r"(async\s+def|def|class)\s", b.head) and b.size <= MAX_REWRITE_LINES):
+            return b
+    return None
+
+
+_LOOKS_RE = re.compile(
+    r"\b(colou?rs?|background|font|fonts|size|bigger|smaller|spacing|margin|padding|border|rounded|shadow|"
+    r"bold|italic|width|height|style|styling|darker|lighter|theme)\b",
+    re.IGNORECASE,
+)
+_STYLESHEET_RE = re.compile(r"<link\b[^>]*rel=[\"']?stylesheet[^>]*>", re.IGNORECASE)
+_HREF_RE = re.compile(r"href=[\"']([^\"']+)[\"']", re.IGNORECASE)
+
+
+def stylesheet_for(html: str, request: str) -> str | None:
+    """The local stylesheet a looks-only change to this page belongs in:
+    the page has no <style> of its own and links exactly one local .css."""
+    if not _LOOKS_RE.search(request) or re.search(r"<style\b", html, re.IGNORECASE):
+        return None
+    hrefs = [m.group(1) for tag in _STYLESHEET_RE.findall(html) for m in [_HREF_RE.search(tag)] if m]
+    local = [h for h in hrefs if not re.match(r"(?i)(https?:)?//", h)]
+    return local[0] if len(local) == 1 else None
