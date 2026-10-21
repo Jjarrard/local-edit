@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>City Center Stall Booking</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f5f7fa;
+            color: #333;
+        }
+        header {
+            background: linear-gradient(135deg, #4CAF50, #2E7D32);
+            color: white;
+            padding: 2rem 1rem;
+            text-align: center;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        .stalls-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 2rem;
+            margin-top: 2rem;
+        }
+        .stall-card {
+            background: white;
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .stall-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+        }
+        .stall-card h2 {
+            margin: 0 0 0.5rem;
+            color: #2E7D32;
+        }
+        .stall-card p {
+            margin: 0.5rem 0;
+            color: #555;
+        }
+        .stall-card .price {
+            font-weight: bold;
+            color: #4CAF50;
+            margin: 0.5rem 0;
+        }
+        .stall-card .status {
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            margin: 0.5rem 0;
+            display: inline-block;
+        }
+        .status-available {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .status-booked {
+            background-color: #f44336;
+            color: white;
+        }
+        .booking-btn {
+            background-color: #2E7D32;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1rem;
+            margin-top: 1rem;
+            transition: background-color 0.3s ease;
+        }
+        .booking-btn:hover {
+            background-color: #215E2E;
+        }
+        footer {
+            text-align: center;
+            padding: 2rem;
+            background-color: #2E7D32;
+            color: white;
+            margin-top: 3rem;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>City Center Stall Booking</h1>
+        <p>Find and book your perfect stall space in the heart of the city</p>
+    </header>
+
+    <div class="container">
+        <div class="stalls-grid">
+            <!-- Stall cards will be populated here by JavaScript -->
+        </div>
+    </div>
+
+    <footer>
+        <p>&copy; 2025 City Center Booking System. All rights reserved.</p>
+    </footer>
+
+    <script>
+        // Sample stall data - in a real app, this would come from a backend API
+        const stallData = [
+            {
+                id: 1,
+                name: "Artisan Coffee Co.",
+                location: "Main Street, near the fountain",
+                price: "$250/week",
+                status: "available",
+                description: "Premium coffee and pastries served daily"
+            },
+            {
+                id: 2,
+                name: "Local Market Bazaar",
+                location: "Downtown Plaza, corner of 5th Ave",
+                price: "$300/week",
+                status: "available",
+                description: "Fresh produce and handmade goods"
+            },
+            {
+                id: 3,
+                name: "Urban Workshop",
+                location: "West Side, near the library",
+                price: "$400/week",
+                status: "booked",
+                description: "Creative workshops and classes"
+            },
+            {
+                id: 4,
+                name: "Gourmet Food Truck",
+                location: "Central Square, by the clock tower",
+                price: "$350/week",
+                status: "available",
+                description: "International cuisine from around the world"
+            },
+            {
+                id: 5,
+                name: "Vintage Bookstore",
+                location: "East End, near the park",
+                price: "$200/week",
+                status: "available",
+                description: "Rare books and collectibles"
+            },
+            {
+                id: 6,
+                name: "Street Performance Zone",
+                location: "Main Square, under the awning",
+                price: "$150/week",
+                status: "booked",
+                description: "Live music and street art"
+            }
+        ];
+
+        // Render the stall cards
+        const stallsGrid = document.querySelector('.stalls-grid');
+        stallData.forEach(stall => {
+            const stallCard = document.createElement('div');
+            stallCard.className = 'stall-card';
+            
+            stallCard.innerHTML = `
+                <h2>${stall.name}</h2>
+                <p><strong>Location:</strong> ${stall.location}</p>
+                <p class="price"><strong>Price:</strong> ${stall.price}</p>
+                <p class="description">${stall.description}</p>
+                <div class="status ${stall.status === 'available' ? 'status-available' : 'status-booked'}">
+                    ${stall.status === 'available' ? 'Available' : 'Booked'}
+                </div>
+                <button class="booking-btn" ${stall.status === 'booked' ? 'disabled' : ''}>
+                    ${stall.status === 'available' ? 'Book Now' : 'Already Booked'}
+                </button>
+            `;
+            
+            stallsGrid.appendChild(stallCard);
+        });
+    </script>
+</body>
+</html>
