@@ -118,6 +118,11 @@ def check_py_median(t, root):
 
 
 def check_h2_blue(t):
+    inline = re.compile(r"<h2[^>]*style=\"[^\"]*color:\s*(blue|#[0-9a-f]{3,6})", re.IGNORECASE)
+    m = inline.search(t)
+    # an inline style on the card's <h2> makes the titles blue just as well
+    if m and colour_is(m.group(1), "blue") and not inline.search(PAGES_ORIG[CURRENT[0]]):
+        return True
     return (colour_is(css_rule(t, ".stall-card h2"), "blue")
             and not colour_is(css_rule(PAGES_ORIG[CURRENT[0]], ".stall-card h2"), "blue"))
 

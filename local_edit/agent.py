@@ -761,7 +761,7 @@ class Agent:
             if rel.endswith(".py"):
                 block = focus.enclosing_function(blocks, block) or block
             self.console.print(f"[dim](rewriting lines {block.start}-{block.end}: {block.head[:60]})[/dim]")
-            code = self._ask_for_code(focus.rewrite_prompt(request, rel, block), block)
+            code = self._ask_for_code(focus.rewrite_prompt(request, rel, block, focus.signatures(blocks, block, request)), block)
             if code is None:
                 return f"ERROR: FIX {rel}: no usable rewrite of lines {block.start}-{block.end} came back", False
             if code == "":
@@ -791,7 +791,7 @@ class Agent:
                 # `if not numbers: raise ...` belongs inside a function, not
                 # after it - so the change is a rewrite of that function.
                 self.console.print(f"[dim](that code goes inside {owner.head[:50]} - rewriting it instead)[/dim]")
-                code = self._ask_for_code(focus.rewrite_prompt(request, rel, owner), owner)
+                code = self._ask_for_code(focus.rewrite_prompt(request, rel, owner, focus.signatures(blocks, owner, request)), owner)
                 if not code:
                     return f"ERROR: FIX {rel}: no usable rewrite of lines {owner.start}-{owner.end} came back", False
                 edit = Action(kind="EDIT", path=rel, start=owner.start, end=owner.end,
@@ -803,6 +803,15 @@ class Agent:
                 where = f"added {len(code.splitlines())} lines after line {after.end}, {after.head[:40]}"
 
         result_text, finished = self._handle_write(edit, active_todo, task_text=request, from_fix=True)
+        if result_text and result_text.startswith("No change"):
+            # The rewrite came back identical: the wrong block was picked,
+            # and "no change" read as success let the model mark it done.
+            return (
+                f"ERROR: FIX {rel} changed nothing - {where.split(', ', 1)[-1]} (lines {edit.start}-"
+                f"{edit.end or edit.start}) was not the part that needs changing. The task is NOT done. Send FIX again naming "
+                f"the function or element that needs the change.",
+                False,
+            )
         if result_text and result_text.startswith("Applied."):
             result_text = f"Applied ({where})." + result_text[len("Applied."):]
         return result_text, finished

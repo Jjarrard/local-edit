@@ -262,3 +262,54 @@ def test_fix_on_a_page_styled_from_a_stylesheet_edits_the_stylesheet(tmp_path):
     assert result.startswith("Applied"), result
     assert "background: green" in (tmp_path / "style.css").read_text()
     assert (tmp_path / "index.html").read_text() == page_before
+
+
+CART = '''function lineTotal(item) {
+  const price = PRICES[item.size];
+  return price;
+}
+
+function cartTotal(cart) {
+  let total = 0;
+  for (const item of cart) {
+    total += lineTotal(item);
+  }
+  return total;
+}
+
+if (typeof document !== "undefined") {
+  document.getElementById("add").addEventListener("click", () => {
+    cart.push({ size: "small", quantity: 1 });
+    show(cartTotal(cart));
+  });
+}
+'''
+
+
+def test_camel_case_names_match_spelled_out_words():
+    picked = focus.candidates(focus.split_blocks(CART), "the cart total ignores the quantity")
+    heads = [b.head for b in picked]
+    assert "function cartTotal(cart) {" in heads
+    assert not any(b.size == 1 and "cart.push" in b.head for b in picked), "covered one-liners are dropped"
+
+
+def test_a_fix_that_changes_nothing_is_an_error_not_done(tmp_path):
+    (tmp_path / "app.js").write_text(CART)
+
+    def answer(prompt):
+        if "Rewrite ONLY" in prompt:  # echoes the block back unchanged
+            return "```js\n" + prompt.split("```\n", 1)[1].split("\n```", 1)[0] + "\n```"
+        return "1"
+
+    agent, _ = _agent(tmp_path, answer)
+    result, finished = agent._handle_action(parse_action("FIX app.js make the cart total use quantity"), None)
+    assert result.startswith("ERROR") and "NOT done" in result and not finished
+
+
+def test_rewrites_are_told_what_other_functions_exist():
+    # Real run: shown only cartTotal, the model invented item.stallPrice.
+    blocks = focus.split_blocks(CART)
+    block = next(b for b in blocks if b.head.startswith("function cartTotal"))
+    sigs = focus.signatures(blocks, block, "the cart total ignores quantity")
+    assert sigs[0] == "function lineTotal(item)"
+    assert "function lineTotal(item)" in focus.rewrite_prompt("x", "app.js", block, sigs)

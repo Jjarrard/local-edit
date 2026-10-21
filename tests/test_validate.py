@@ -131,3 +131,18 @@ def test_content_after_closing_html_is_rejected():
 
     assert not validate("index.html", "<html><body></body></html>\n<div class=\"stall\">x</div>\n").ok
     assert validate("index.html", "<html><body></body></html>\n\n").ok
+
+
+def test_js_syntax_errors_with_balanced_brackets_are_caught():
+    import shutil
+
+    import pytest
+
+    from local_edit.validate import validate
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed - JS falls back to bracket balance")
+    assert validate("app.js", "const x = 5;\n").ok
+    assert validate("app.js", 'import a from "./b.js";\nexport const c = a;\n').ok
+    bad = validate("app.js", "function f() {\n  if (x) {\n  }\n  else else {}\n}\n")
+    assert not bad.ok and "line 4" in bad.message

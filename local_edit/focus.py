@@ -130,8 +130,13 @@ _ABBREVIATIONS = {
 _STATE_RE = re.compile(r":(hover|focus|active|visited|before|after)\b")
 
 
+_CAMEL_RE = re.compile(r"([a-z0-9])([A-Z])")
+
+
 def _words(text: str) -> set[str]:
-    words = set(_WORD_RE.findall(text.lower()))
+    # cartTotal -> cart, total: people say "the cart total", JS says
+    # cartTotal, and as one word it matched nothing (snake_case already splits)
+    words = set(_WORD_RE.findall(_CAMEL_RE.sub(r"\1 \2", text).lower()))
     words |= {_ABBREVIATIONS[w] for w in words if w in _ABBREVIATIONS}
     # crude stems so "colours"/"colour", "buttons"/"button" meet
     return words | {w[:-1] for w in words if w.endswith("s") and len(w) > 4}
@@ -183,6 +188,11 @@ def candidates(blocks: list[Block], request: str, limit: int = MAX_CHOICES) -> l
             continue
         same_head[b.head] = same_head.get(b.head, 0) + 1
         picked.append(b)
+    # A single line inside another listed block is already covered by it,
+    # and three slices of one click handler crowd out the function that
+    # actually needs the change.
+    picked = [b for b in picked if b.size > 1 or not any(
+        o is not b and o.size > 1 and o.start <= b.start and b.end <= o.end for o in picked)]
     return sorted(picked, key=lambda b: b.start)
 
 
@@ -315,9 +325,36 @@ def place_prompt(request: str, rel: str, spots: list[Block]) -> str:
     )
 
 
-def rewrite_prompt(request: str, rel: str, block: Block) -> str:
+_SIGNATURE_RE = re.compile(
+    r"^(?:export\s+)?(?:async\s+)?(?:def|function|class)\s+\w+|^(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*"
+    r"(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>"
+)
+MAX_SIGNATURES = 8
+_NAME_RE = re.compile(r"(?:def|function|class|const|let|var)\s+(\w+)")
+
+
+def signatures(blocks: list[Block], skip: Block, request: str = "", limit: int = MAX_SIGNATURES) -> list[str]:
+    """One line per other top-level function a rewrite can use: the ones
+    the block calls, then ones the request names, then the nearest. Shown
+    only the cart total loop, a small model invented `item.stallPrice`;
+    one line saying `function lineTotal(item)` exists was what it lacked."""
+    words = request_words(request)
+    called = set(re.findall(r"\b(\w+)\s*\(", skip.text))
+    found = []
+    for b in blocks:
+        if b.depth == 0 and b is not skip and _SIGNATURE_RE.match(b.head):
+            m = _NAME_RE.search(b.head)
+            name = m.group(1) if m else ""
+            rank = (0 if name in called else 1, -len(words & _words(name)), abs(b.start - skip.start))
+            found.append((rank, b.head.rstrip("{: ").strip()))
+    return [sig for _, sig in sorted(found)[:limit]]
+
+
+def rewrite_prompt(request: str, rel: str, block: Block, others: list[str] | None = None) -> str:
+    context = ("Other functions in this file you can use:\n" + "\n".join(f"  {o}" for o in others) + "\n\n"
+               if others else "")
     return (
-        f"Task: {request}\nFile: {rel} (lines {block.start}-{block.end} shown)\n\n```\n{block.text}\n```\n\n"
+        f"Task: {request}\nFile: {rel} (lines {block.start}-{block.end} shown)\n\n{context}```\n{block.text}\n```\n\n"
         "Rewrite ONLY these lines so the task is done. Keep everything else in them the same.\n"
         "Reply with the complete new version of these lines in one ``` block, nothing else."
     )

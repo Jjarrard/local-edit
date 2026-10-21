@@ -191,6 +191,138 @@ def stalls(root):
     shutil.copy(HERE / "fixtures" / "stalls.html", root / "index.html")
 
 
+_JS_HEAD = """// Stall booking cart for the city market.
+
+const PRICES = { small: 20, medium: 35, large: 50 };
+
+function lineTotal(item) {
+  const price = PRICES[item.size];
+  if (price === undefined) {
+    throw new Error("unknown stall size: " + item.size);
+  }
+  return price;
+}
+
+function cartTotal(cart) {
+  let total = 0;
+  for (const item of cart) {
+    total += lineTotal(item);
+  }
+  return total;
+}
+
+function applyDiscount(total, code) {
+  if (code === "SAVE10") {
+    return total * 0.9;
+  }
+  return total;
+}
+"""
+
+_JS_DOM = """
+if (typeof document !== "undefined") {
+  const cart = [];
+  document.getElementById("add-btn").addEventListener("click", () => {
+    const size = document.getElementById("size").value;
+    cart.push({ id: Date.now(), size: size, quantity: 1 });
+    document.getElementById("total").textContent = cartTotal(cart).toFixed(2);
+  });
+}
+"""
+
+
+def cart_js(root):
+    """~320 lines of booking-cart script; lineTotal ignores quantity and
+    applyDiscount only takes upper-case codes."""
+    parts = [_JS_HEAD]
+    for thing in _THINGS[:16]:
+        cap = thing.capitalize()
+        parts.append(f"""
+function format{cap}Label(stall) {{
+  const name = (stall.name || "").trim();
+  if (!name) {{
+    return "{cap} stall";
+  }}
+  return name + " ({thing})";
+}}
+
+function count{cap}Bookings(bookings) {{
+  let count = 0;
+  for (const b of bookings) {{
+    if (b.kind === "{thing}") {{
+      count += 1;
+    }}
+  }}
+  return count;
+}}
+""")
+    parts.append(_JS_DOM)
+    (root / "app.js").write_text("".join(parts))
+    (root / "index.html").write_text(_page("Book a stall", NAV, """        <select id="size"><option>small</option><option>large</option></select>
+        <button id="add-btn" class="btn">Add</button>
+        <p>Total: <span id="total">0.00</span></p>""").replace(
+        "</body>", '    <script src="app.js"></script>\n</body>'))
+    (root / "style.css").write_text(STYLE)
+
+
+_JS_RUNNER = """
+const fs = require("fs"), vm = require("vm");
+const ctx = {};
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), ctx);
+const out = {};
+for (const [k, v] of Object.entries(ctx)) if (typeof v === "function") out["fn:" + k] = v.toString();
+try { out.result = vm.runInContext(process.argv[2], ctx); } catch (e) { out.error = String(e); }
+console.log(JSON.stringify(out));
+"""
+
+
+def _js(root, expr):
+    """Run app.js in a sandbox, evaluate `expr` in it; also returns the
+    source of every top-level function, to see what else was touched."""
+    import json
+
+    r = subprocess.run(["node", "-e", _JS_RUNNER, str(root / "app.js"), expr], capture_output=True, text=True)
+    if r.returncode != 0:
+        return {"error": r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "node failed"}
+    return json.loads(r.stdout)
+
+
+def _js_others_changed(root, before_root_text, allowed):
+    tmp = root / ".before.js"
+    tmp.write_text(before_root_text)
+    try:
+        import json
+
+        r = subprocess.run(["node", "-e", _JS_RUNNER, str(tmp), "0"], capture_output=True, text=True)
+        before_fns = {k: v for k, v in json.loads(r.stdout).items() if k.startswith("fn:")}
+    finally:
+        tmp.unlink()
+    after = _js(root, "0")
+    return [k[3:] for k, v in before_fns.items() if k[3:] not in allowed and after.get(k) != v]
+
+
+def _js_task(expr, expect, allowed):
+    def check(root, before):
+        out = _js(root, f"JSON.stringify({expr})")
+        if "error" in out:
+            return False, f"error: {out['error']}"
+        got = out["result"]
+        changed = _js_others_changed(root, before["app.js"], allowed)
+        valid = validate("app.js", (root / "app.js").read_text()).ok
+        return got == expect and not changed and valid, f"got {got} want {expect} others changed={changed[:4]} valid={valid}"
+    return check
+
+
+check_js_quantity = _js_task(
+    '[cartTotal([{size:"small",quantity:3}]), cartTotal([{size:"large",quantity:2},{size:"small",quantity:1}])]',
+    "[60,120]", {"lineTotal", "cartTotal"})
+check_js_case = _js_task('[applyDiscount(100,"save10"), applyDiscount(100,"SAVE10"), applyDiscount(100,"nope")]',
+                         "[90,90,100]", {"applyDiscount"})
+check_js_remove = _js_task('removeItem([{id:1,size:"small"},{id:2,size:"large"}], 1)',
+                           '[{"id":2,"size":"large"}]', {"removeItem"})
+
+
 # -- checks ------------------------------------------------------------------------
 
 def _html_ok(text):
@@ -302,6 +434,11 @@ TASKS = {
     "median": (calc_project, "add a median(numbers) function to calc.py and a test for it in test_calc.py",
                check_median),
     "modern": (stalls, "make the page look more modern", check_modern),
+    "jsquantity": (cart_js, "the cart total ignores how many of each stall are booked (the quantity) - fix it",
+                   check_js_quantity),
+    "jscase": (cart_js, "discount codes should work in lowercase too, like save10", check_js_case),
+    "jsremove": (cart_js, "add a removeItem(cart, id) function to app.js that returns the cart without "
+                          "the item with that id", check_js_remove),
 }
 
 

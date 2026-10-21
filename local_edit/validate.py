@@ -15,6 +15,9 @@ from __future__ import annotations
 import configparser
 import json
 import re
+import shutil
+import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,6 +167,39 @@ def _balanced_delimiters(text: str) -> ValidationResult:
     return ValidationResult.good()
 
 
+_NODE_ERROR_RE = re.compile(r":(\d+)\n(?:.*\n)*?(SyntaxError: .*)")
+
+
+def _validate_js(text: str) -> ValidationResult:
+    """Brackets first, then node's own parser when node is installed.
+
+    Balanced brackets miss most real breakage - `const = 5`, a stray
+    `else`, a property list pasted into a function body - and node --check
+    parses without running anything. Without node, brackets are all we have.
+    """
+    brackets = _balanced_delimiters(text)
+    if not brackets.ok or shutil.which("node") is None:
+        return brackets
+    for suffix in (".js", ".mjs"):  # .mjs: a file using import/export
+        with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False) as fh:
+            fh.write(text)
+        try:
+            proc = subprocess.run(["node", "--check", fh.name], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return brackets
+        finally:
+            Path(fh.name).unlink(missing_ok=True)
+        if proc.returncode == 0:
+            return ValidationResult.good()
+        if suffix == ".js" and re.search(r"import statement|export|module", proc.stderr):
+            continue
+        m = _NODE_ERROR_RE.search(proc.stderr)
+        if m:
+            return ValidationResult.bad(f"JavaScript syntax error at line {m.group(1)}: {m.group(2)}")
+        return ValidationResult.bad("JavaScript syntax error: " + (proc.stderr.strip().splitlines() or ["?"])[-1])
+    return brackets
+
+
 BRACKET_LANGUAGES = {".js", ".jsx", ".ts", ".tsx", ".c", ".h", ".cpp", ".hpp", ".java", ".go", ".rs", ".css"}
 
 # suffix -> validator, so a new language/tool can be wired in with one line
@@ -172,6 +208,7 @@ VALIDATORS: dict[str, Callable[[str], ValidationResult]] = {".py": _validate_pyt
 VALIDATORS.update({suffix: _validate_ini for suffix in (".ini", ".cfg")})
 VALIDATORS[".toml"] = _validate_toml
 VALIDATORS.update({suffix: _balanced_delimiters for suffix in BRACKET_LANGUAGES})
+VALIDATORS.update({suffix: _validate_js for suffix in (".js", ".mjs", ".cjs")})
 
 
 _HTML_CONTAINERS = ("html", "head", "body", "style", "script")
